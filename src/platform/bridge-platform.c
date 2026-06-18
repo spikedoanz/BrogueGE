@@ -417,6 +417,17 @@ int brh_bridge_should_refresh_dungeon_cell(void) {
     return bridgeCaptureMode == BRH_CAPTURE_FULL;
 }
 
+int brh_bridge_allows_compact_simulation_shortcuts(void) {
+    const char *value;
+
+    if (bridgeCaptureMode != BRH_CAPTURE_COMPACT) {
+        return 0;
+    }
+
+    value = getenv("BROGUE_COMPACT_SIMULATION_SHORTCUTS");
+    return (value != NULL && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+}
+
 void brh_bridge_update_compact_cell(short x, short y) {
     if (bridgeCaptureMode == BRH_CAPTURE_COMPACT) {
         bridge_compact_update_map_cell(x, y);

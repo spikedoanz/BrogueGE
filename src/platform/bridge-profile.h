@@ -12,6 +12,7 @@ uint64_t brh_profile_zone_start(int zone);
 void brh_profile_zone_end(int zone, uint64_t start_ns);
 int brh_bridge_should_refresh_sidebar(void);
 int brh_bridge_should_refresh_dungeon_cell(void);
+int brh_bridge_allows_compact_simulation_shortcuts(void);
 void brh_bridge_update_compact_cell(short x, short y);
 
 static inline int brh_profile_enabled_inline(void) {
@@ -41,6 +42,10 @@ static inline int brh_bridge_should_refresh_sidebar(void) {
 
 static inline int brh_bridge_should_refresh_dungeon_cell(void) {
     return 1;
+}
+
+static inline int brh_bridge_allows_compact_simulation_shortcuts(void) {
+    return 0;
 }
 
 static inline void brh_bridge_update_compact_cell(short x, short y) {

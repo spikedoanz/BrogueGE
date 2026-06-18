@@ -995,8 +995,8 @@ void updateVision(boolean refreshDisplay) {
     short i, j;
     char grid[DCOLS][DROWS];
     item *theItem;
-    boolean compactBridgeMode = !brh_bridge_should_refresh_dungeon_cell();
-    boolean compactVisibilityOnly = (compactBridgeMode
+    boolean compactSimulationShortcuts = brh_bridge_allows_compact_simulation_shortcuts();
+    boolean compactVisibilityOnly = (compactSimulationShortcuts
                                      && rogue.clairvoyance == 0
                                      && !player.status[STATUS_TELEPATHIC]
                                      && !telepathyVisibleThisTurn
@@ -1065,7 +1065,7 @@ void updateVision(boolean refreshDisplay) {
         updateFieldOfViewDisplayCompactUnlit(visionFieldOfViewCells, visionFieldOfViewCellCount,
                                             visionWasVisibleCells, visionWasVisibleCellCount,
                                             refreshDisplay);
-    } else if (compactBridgeMode
+    } else if (compactSimulationShortcuts
                && rogue.clairvoyance == 0
                && !telepathyVisibleThisTurn
                && !telepathyWasVisibleThisTurn) {
@@ -1848,7 +1848,7 @@ void updateEnvironment() {
     const floorTileType *tile;
     pos cell;
     boolean isVolumetricGas = false;
-    boolean compactBridgeMode = !brh_bridge_should_refresh_dungeon_cell();
+    boolean compactSimulationShortcuts = brh_bridge_allows_compact_simulation_shortcuts();
     BRH_PROFILE_START(_brh_profile_update_environment, BRH_ZONE_UPDATE_ENVIRONMENT);
 
     BRH_PROFILE_START(_brh_profile_env_fall, BRH_ZONE_ENV_FALL);
@@ -1864,7 +1864,7 @@ void updateEnvironment() {
     exposedToFireCellCount = 0;
     BRH_PROFILE_END(BRH_ZONE_ENV_RESET_FIRE, _brh_profile_env_reset_fire);
 
-    if (compactBridgeMode) {
+    if (compactSimulationShortcuts) {
         BRH_PROFILE_START(_brh_profile_env_bookkeeping, BRH_ZONE_ENV_BOOKKEEPING);
         for (idx=0; idx<caughtFireCellCount; idx++) {
             cell = caughtFireCells[idx];
@@ -2711,7 +2711,7 @@ static void recordCurrentCreatureHealths() {
 static boolean playerTurnEndedCompactFast() {
     short elapsedTicks;
 
-    if (brh_bridge_should_refresh_dungeon_cell()
+    if (!brh_bridge_allows_compact_simulation_shortcuts()
         || rogue.playbackMode
         || rogue.automationActive
         || rogue.gameHasEnded
@@ -3069,7 +3069,8 @@ void playerTurnEnded() {
                 }
 
                 // Rolling waypoint refresh:
-                if (brh_bridge_should_refresh_dungeon_cell()) {
+                if (brh_bridge_should_refresh_dungeon_cell()
+                    || !brh_bridge_allows_compact_simulation_shortcuts()) {
                     rogue.wpRefreshTicker++;
                     if (rogue.wpRefreshTicker >= rogue.wpCount) {
                         rogue.wpRefreshTicker = 0;

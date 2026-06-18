@@ -313,11 +313,11 @@ void updateLighting() {
     short i, j, k;
     int glowIndex;
     enum tileType tile;
-    boolean compactBridgeMode = !brh_bridge_should_refresh_dungeon_cell();
+    boolean compactSimulationShortcuts = brh_bridge_allows_compact_simulation_shortcuts();
 
     // Copy Light over oldLight
     BRH_PROFILE_START(_brh_profile_lighting_reset, BRH_ZONE_LIGHTING_RESET);
-    if (!compactBridgeMode) {
+    if (!compactSimulationShortcuts) {
         recordOldLights();
     }
 
@@ -337,7 +337,7 @@ void updateLighting() {
     if (glowCacheDirty) {
         rebuildGlowCache();
     }
-    if (compactBridgeMode) {
+    if (compactSimulationShortcuts) {
         BRH_PROFILE_END(BRH_ZONE_LIGHTING_TILE_GLOW, _brh_profile_lighting_tile_glow);
         goto paint_creature_lights;
     }
@@ -387,14 +387,14 @@ paint_creature_lights:
     BRH_PROFILE_END(BRH_ZONE_LIGHTING_CREATURES, _brh_profile_lighting_creatures);
 
     BRH_PROFILE_START(_brh_profile_lighting_display_detail, BRH_ZONE_LIGHTING_DISPLAY_DETAIL);
-    if (!compactBridgeMode) {
+    if (!compactSimulationShortcuts) {
         updateDisplayDetail();
     }
     BRH_PROFILE_END(BRH_ZONE_LIGHTING_DISPLAY_DETAIL, _brh_profile_lighting_display_detail);
 
     // Miner's light:
     BRH_PROFILE_START(_brh_profile_lighting_miner, BRH_ZONE_LIGHTING_MINER);
-    if (compactBridgeMode && rogue.minersLight.passThroughCreatures) {
+    if (compactSimulationShortcuts && rogue.minersLight.passThroughCreatures) {
         paintMinersLightFromCurrentFOV(&rogue.minersLight, player.loc.x, player.loc.y);
     } else {
         paintLight(&rogue.minersLight, player.loc.x, player.loc.y, true, true);
