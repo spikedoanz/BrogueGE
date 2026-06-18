@@ -3119,6 +3119,12 @@ extern "C" {
     boolean exposeTileToFire(short x, short y, boolean alwaysIgnite);
     boolean cellCanHoldGas(short x, short y);
     void monstersFall(void);
+    void markVolumetricGasMapDirty(void);
+    void markEnvironmentTerrainCacheDirty(void);
+    void markWaypointRefreshDirty(void);
+    void markWaypointRefreshComplete(void);
+    void markCaughtFireThisTurn(short x, short y);
+    void markPressurePlateDepressed(short x, short y);
     void updateEnvironment(void);
     void updateAllySafetyMap(void);
     void updateSafetyMap(void);
@@ -3156,6 +3162,12 @@ extern "C" {
 
     void storeMemories(const short x, const short y);
     void updateFieldOfViewDisplay(boolean updateDancingTerrain, boolean refreshDisplay);
+    void updateFieldOfViewDisplayCompact(const pos *fovCells, short fovCellCount,
+                                         const pos *wasVisibleCells, short wasVisibleCellCount,
+                                         boolean refreshDisplay);
+    void updateFieldOfViewDisplayCompactUnlit(const pos *fovCells, short fovCellCount,
+                                              const pos *wasVisibleCells, short wasVisibleCellCount,
+                                              boolean refreshDisplay);
     void updateFieldOfView(short xLoc, short yLoc, short radius, boolean paintScent,
                            boolean passThroughCreatures, boolean setFieldOfView, short theColor[3], short fadeToPercent);
     void betweenOctant1andN(short *x, short *y, short x0, short y0, short n);
@@ -3426,6 +3438,7 @@ extern "C" {
     boolean paintLight(const lightSource *theLight, short x, short y, boolean isMinersLight, boolean maintainShadows);
     void backUpLighting(short lights[DCOLS][DROWS][3]);
     void restoreLighting(short lights[DCOLS][DROWS][3]);
+    void markLightingMapDirty(void);
     void updateLighting(void);
     boolean playerInDarkness(void);
     flare *newFlare(const lightSource *light, short x, short y, short changePerFrame, short limit);

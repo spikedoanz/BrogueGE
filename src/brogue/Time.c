@@ -24,6 +24,217 @@
 #include "Rogue.h"
 #include "GlobalsBase.h"
 #include "Globals.h"
+#include "bridge-profile.h"
+
+static boolean volumetricGasCacheKnown = false;
+static boolean volumetricGasCachePresent = false;
+static boolean volumetricGasBoundsKnown = false;
+static short volumetricGasMinX = 0;
+static short volumetricGasMinY = 0;
+static short volumetricGasMaxX = -1;
+static short volumetricGasMaxY = -1;
+static boolean volumetricGasCellsKnown = false;
+static pos volumetricGasCells[DCOLS * DROWS];
+static short volumetricGasCellCount = 0;
+static pos volumetricGasCandidateCells[DCOLS * DROWS];
+static short volumetricGasCandidateCellCount = 0;
+static unsigned short volumetricGasCandidateMarks[DCOLS][DROWS];
+static unsigned short volumetricGasCandidateMark = 1;
+static pos exposedToFireCells[DCOLS * DROWS];
+static short exposedToFireCellCount = 0;
+static pos caughtFireCells[DCOLS * DROWS];
+static short caughtFireCellCount = 0;
+static pos depressedPressurePlateCells[DCOLS * DROWS];
+static short depressedPressurePlateCellCount = 0;
+static pos promotableCells[DCOLS * DROWS];
+static short promotableCellCount = 0;
+static pos keylessPromotionCells[DCOLS * DROWS];
+static short keylessPromotionCellCount = 0;
+static pos fireCells[DCOLS * DROWS];
+static short fireCellCount = 0;
+static unsigned long environmentTerrainFlagsCache[DCOLS][DROWS];
+static boolean environmentTerrainCacheDirty = true;
+static boolean gasTerrainCacheDirty = true;
+static boolean terrainObstructsGasCache[DCOLS][DROWS];
+static boolean terrainAutoDescentCache[DCOLS][DROWS];
+static boolean waypointRefreshDirty = false;
+static short waypointRefreshRemaining = 0;
+static pos visionFieldOfViewCells[DCOLS * DROWS];
+static short visionFieldOfViewCellCount = 0;
+static pos visionWasVisibleCells[DCOLS * DROWS];
+static short visionWasVisibleCellCount = 0;
+static boolean telepathyVisibleThisTurn = false;
+static boolean telepathyWasVisibleThisTurn = false;
+
+void markVolumetricGasMapDirty(void) {
+    volumetricGasCacheKnown = false;
+    volumetricGasBoundsKnown = false;
+    volumetricGasCellsKnown = false;
+}
+
+void markWaypointRefreshDirty(void) {
+    waypointRefreshDirty = true;
+    waypointRefreshRemaining = rogue.wpCount;
+}
+
+void markWaypointRefreshComplete(void) {
+    waypointRefreshDirty = false;
+    waypointRefreshRemaining = 0;
+}
+
+void markEnvironmentTerrainCacheDirty(void) {
+    environmentTerrainCacheDirty = true;
+    gasTerrainCacheDirty = true;
+    markWaypointRefreshDirty();
+}
+
+static void markEnvironmentTerrainCacheDirtyForGasLayer(void) {
+    environmentTerrainCacheDirty = true;
+}
+
+void markCaughtFireThisTurn(short x, short y) {
+    if (!(pmap[x][y].flags & CAUGHT_FIRE_THIS_TURN) && caughtFireCellCount < DCOLS * DROWS) {
+        caughtFireCells[caughtFireCellCount++] = (pos){ x, y };
+    }
+    pmap[x][y].flags |= CAUGHT_FIRE_THIS_TURN;
+}
+
+void markPressurePlateDepressed(short x, short y) {
+    if (!(pmap[x][y].flags & PRESSURE_PLATE_DEPRESSED) && depressedPressurePlateCellCount < DCOLS * DROWS) {
+        depressedPressurePlateCells[depressedPressurePlateCellCount++] = (pos){ x, y };
+    }
+    pmap[x][y].flags |= PRESSURE_PLATE_DEPRESSED;
+}
+
+static void rebuildEnvironmentTerrainCache(void) {
+    short i, j;
+    enum dungeonLayers layer;
+    boolean cellPromotable, cellKeyless, cellFire;
+    unsigned long flags;
+    const floorTileType *tile;
+
+    promotableCellCount = 0;
+    keylessPromotionCellCount = 0;
+    fireCellCount = 0;
+
+    for (i=0; i<DCOLS; i++) {
+        for (j=0; j<DROWS; j++) {
+            cellPromotable = false;
+            cellKeyless = false;
+            cellFire = false;
+            flags = 0;
+            for (layer = 0; layer < NUMBER_TERRAIN_LAYERS; layer++) {
+                tile = &(tileCatalog[pmap[i][j].layers[layer]]);
+                flags |= tile->flags;
+                if (tile->promoteChance) {
+                    cellPromotable = true;
+                }
+                if (tile->mechFlags & TM_PROMOTES_WITHOUT_KEY) {
+                    cellKeyless = true;
+                }
+                if (tile->flags & T_IS_FIRE) {
+                    cellFire = true;
+                }
+            }
+            environmentTerrainFlagsCache[i][j] = flags;
+            if (cellPromotable && promotableCellCount < DCOLS * DROWS) {
+                promotableCells[promotableCellCount++] = (pos){ i, j };
+            }
+            if (cellKeyless && keylessPromotionCellCount < DCOLS * DROWS) {
+                keylessPromotionCells[keylessPromotionCellCount++] = (pos){ i, j };
+            }
+            if (cellFire && fireCellCount < DCOLS * DROWS) {
+                fireCells[fireCellCount++] = (pos){ i, j };
+            }
+        }
+    }
+
+    environmentTerrainCacheDirty = false;
+}
+
+static void ensureEnvironmentTerrainCache(void) {
+    if (environmentTerrainCacheDirty) {
+        rebuildEnvironmentTerrainCache();
+    }
+}
+
+static void rebuildGasTerrainCache(void) {
+    short i, j;
+    unsigned long flags;
+
+    for (i=0; i<DCOLS; i++) {
+        for (j=0; j<DROWS; j++) {
+            flags = (tileCatalog[pmap[i][j].layers[DUNGEON]].flags
+                     | tileCatalog[pmap[i][j].layers[LIQUID]].flags
+                     | tileCatalog[pmap[i][j].layers[SURFACE]].flags);
+            terrainObstructsGasCache[i][j] = (flags & T_OBSTRUCTS_GAS) ? true : false;
+            terrainAutoDescentCache[i][j] = (flags & T_AUTO_DESCENT) ? true : false;
+        }
+    }
+
+    gasTerrainCacheDirty = false;
+}
+
+static void ensureGasTerrainCache(void) {
+    if (gasTerrainCacheDirty) {
+        rebuildGasTerrainCache();
+    }
+}
+
+static void resetVolumetricGasCandidates(void) {
+    volumetricGasCandidateCellCount = 0;
+    volumetricGasCandidateMark++;
+    if (volumetricGasCandidateMark == 0) {
+        memset(volumetricGasCandidateMarks, 0, sizeof(volumetricGasCandidateMarks));
+        volumetricGasCandidateMark = 1;
+    }
+}
+
+static void addVolumetricGasCandidate(short x, short y) {
+    if (!coordinatesAreInMap(x, y)
+        || volumetricGasCandidateMarks[x][y] == volumetricGasCandidateMark
+        || volumetricGasCandidateCellCount >= DCOLS * DROWS) {
+
+        return;
+    }
+
+    volumetricGasCandidateMarks[x][y] = volumetricGasCandidateMark;
+    volumetricGasCandidateCells[volumetricGasCandidateCellCount++] = (pos){ x, y };
+}
+
+static void buildVolumetricGasCandidatesFromActiveCells(void) {
+    short idx, direction;
+    pos cell;
+
+    resetVolumetricGasCandidates();
+    for (idx=0; idx<volumetricGasCellCount; idx++) {
+        cell = volumetricGasCells[idx];
+        addVolumetricGasCandidate(cell.x, cell.y);
+        for (direction=0; direction<DIRECTION_COUNT; direction++) {
+            addVolumetricGasCandidate(cell.x + nbDirs[direction][0],
+                                      cell.y + nbDirs[direction][1]);
+        }
+    }
+}
+
+static boolean levelHasVolumetricGas(void) {
+    short i, j;
+
+    if (volumetricGasCacheKnown) {
+        return volumetricGasCachePresent;
+    }
+
+    volumetricGasCachePresent = false;
+    for (i=0; i<DCOLS && !volumetricGasCachePresent; i++) {
+        for (j=0; j<DROWS && !volumetricGasCachePresent; j++) {
+            if (pmap[i][j].layers[GAS]) {
+                volumetricGasCachePresent = true;
+            }
+        }
+    }
+    volumetricGasCacheKnown = true;
+    return volumetricGasCachePresent;
+}
 
 void exposeCreatureToFire(creature *monst) {
     char buf[COLS], buf2[COLS];
@@ -219,7 +430,7 @@ void applyInstantTileEffectsToCreature(creature *monst) {
         && cellHasTerrainFlag((pos){ *x, *y }, T_IS_DF_TRAP)
         && !(pmap[*x][*y].flags & PRESSURE_PLATE_DEPRESSED)) {
 
-        pmap[*x][*y].flags |= PRESSURE_PLATE_DEPRESSED;
+        markPressurePlateDepressed(*x, *y);
         if (playerCanSee(*x, *y) && cellHasTMFlag((pos){ *x, *y }, TM_IS_SECRET)) {
             discover(*x, *y);
             refreshDungeonCell((pos){ *x, *y });
@@ -601,11 +812,21 @@ static void updateTelepathy() {
     short i, j;
     boolean grid[DCOLS][DROWS];
 
+    if (!player.status[STATUS_TELEPATHIC]
+        && !telepathyVisibleThisTurn
+        && !telepathyWasVisibleThisTurn) {
+
+        return;
+    }
+
+    telepathyVisibleThisTurn = false;
+    telepathyWasVisibleThisTurn = false;
     for (i=0; i<DCOLS; i++) {
         for (j=0; j<DROWS; j++) {
             pmap[i][j].flags &= ~WAS_TELEPATHIC_VISIBLE;
             if (pmap[i][j].flags & TELEPATHIC_VISIBLE) {
                 pmap[i][j].flags |= WAS_TELEPATHIC_VISIBLE;
+                telepathyWasVisibleThisTurn = true;
             }
             pmap[i][j].flags &= ~(TELEPATHIC_VISIBLE);
         }
@@ -617,6 +838,7 @@ static void updateTelepathy() {
         if (monsterRevealed(monst)) {
             getFOVMask(grid, monst->loc.x, monst->loc.y, 2 * FP_FACTOR, T_OBSTRUCTS_VISION, 0, false);
             pmapAt(monst->loc)->flags |= TELEPATHIC_VISIBLE;
+            telepathyVisibleThisTurn = true;
             discoverCell(monst->loc.x, monst->loc.y);
         }
     }
@@ -625,6 +847,7 @@ static void updateTelepathy() {
         if (monsterRevealed(monst)) {
             getFOVMask(grid, monst->loc.x, monst->loc.y, 2 * FP_FACTOR, T_OBSTRUCTS_VISION, 0, false);
             pmapAt(monst->loc)->flags |= TELEPATHIC_VISIBLE;
+            telepathyVisibleThisTurn = true;
             discoverCell(monst->loc.x, monst->loc.y);
         }
     }
@@ -632,6 +855,7 @@ static void updateTelepathy() {
         for (j = 0; j < DROWS; j++) {
             if (grid[i][j]) {
                 pmap[i][j].flags |= TELEPATHIC_VISIBLE;
+                telepathyVisibleThisTurn = true;
                 discoverCell(i, j);
             }
         }
@@ -718,13 +942,41 @@ short currentStealthRange() {
 void demoteVisibility() {
     short i, j;
 
+    visionWasVisibleCellCount = 0;
     for (i=0; i<DCOLS; i++) {
         for (j=0; j<DROWS; j++) {
             pmap[i][j].flags &= ~WAS_VISIBLE;
             if (pmap[i][j].flags & VISIBLE) {
+                if (visionWasVisibleCellCount < DCOLS * DROWS) {
+                    visionWasVisibleCells[visionWasVisibleCellCount++] = (pos){ i, j };
+                }
                 pmap[i][j].flags &= ~VISIBLE;
                 pmap[i][j].flags |= WAS_VISIBLE;
             }
+        }
+    }
+}
+
+static void demoteVisibilityCompact() {
+    short index;
+    pos cell;
+
+    for (index=0; index<visionWasVisibleCellCount; index++) {
+        cell = visionWasVisibleCells[index];
+        pmap[cell.x][cell.y].flags &= ~WAS_VISIBLE;
+    }
+
+    visionWasVisibleCellCount = 0;
+    for (index=0; index<visionFieldOfViewCellCount; index++) {
+        cell = visionFieldOfViewCells[index];
+        pmap[cell.x][cell.y].flags &= ~IN_FIELD_OF_VIEW;
+        pmap[cell.x][cell.y].flags &= ~WAS_VISIBLE;
+        if (pmap[cell.x][cell.y].flags & VISIBLE) {
+            if (visionWasVisibleCellCount < DCOLS * DROWS) {
+                visionWasVisibleCells[visionWasVisibleCellCount++] = cell;
+            }
+            pmap[cell.x][cell.y].flags &= ~VISIBLE;
+            pmap[cell.x][cell.y].flags |= WAS_VISIBLE;
         }
     }
 }
@@ -743,37 +995,87 @@ void updateVision(boolean refreshDisplay) {
     short i, j;
     char grid[DCOLS][DROWS];
     item *theItem;
+    boolean compactBridgeMode = !brh_bridge_should_refresh_dungeon_cell();
+    boolean compactVisibilityOnly = (compactBridgeMode
+                                     && rogue.clairvoyance == 0
+                                     && !player.status[STATUS_TELEPATHIC]
+                                     && !telepathyVisibleThisTurn
+                                     && !telepathyWasVisibleThisTurn);
+    BRH_PROFILE_START(_brh_profile_update_vision, BRH_ZONE_UPDATE_VISION);
 
-    demoteVisibility();
-    for (i=0; i<DCOLS; i++) {
-        for (j=0; j<DROWS; j++) {
-            pmap[i][j].flags &= ~IN_FIELD_OF_VIEW;
+    BRH_PROFILE_START(_brh_profile_vision_demote_reset, BRH_ZONE_VISION_DEMOTE_RESET);
+    if (compactVisibilityOnly) {
+        demoteVisibilityCompact();
+    } else {
+        demoteVisibility();
+        for (i=0; i<DCOLS; i++) {
+            for (j=0; j<DROWS; j++) {
+                pmap[i][j].flags &= ~IN_FIELD_OF_VIEW;
+            }
         }
     }
+    BRH_PROFILE_END(BRH_ZONE_VISION_DEMOTE_RESET, _brh_profile_vision_demote_reset);
 
     // Calculate player's field of view (distinct from what is visible, as lighting hasn't been done yet).
+    BRH_PROFILE_START(_brh_profile_vision_fov, BRH_ZONE_VISION_FOV);
     zeroOutGrid(grid);
     getFOVMask(grid, player.loc.x, player.loc.y, (DCOLS + DROWS) * FP_FACTOR, (T_OBSTRUCTS_VISION), 0, false);
+    visionFieldOfViewCellCount = 0;
     for (i=0; i<DCOLS; i++) {
         for (j=0; j<DROWS; j++) {
             if (grid[i][j]) {
                 pmap[i][j].flags |= IN_FIELD_OF_VIEW;
+                if (visionFieldOfViewCellCount < DCOLS * DROWS) {
+                    visionFieldOfViewCells[visionFieldOfViewCellCount++] = (pos){ i, j };
+                }
             }
         }
     }
     pmapAt(player.loc)->flags |= IN_FIELD_OF_VIEW | VISIBLE;
+    BRH_PROFILE_END(BRH_ZONE_VISION_FOV, _brh_profile_vision_fov);
 
     if (rogue.clairvoyance < 0) {
         discoverCell(player.loc.x, player.loc.y);
     }
 
+    BRH_PROFILE_START(_brh_profile_vision_senses, BRH_ZONE_VISION_SENSES);
     if (rogue.clairvoyance != 0) {
         updateClairvoyance();
     }
 
     updateTelepathy();
-    updateLighting();
-    updateFieldOfViewDisplay(true, refreshDisplay);
+    BRH_PROFILE_END(BRH_ZONE_VISION_SENSES, _brh_profile_vision_senses);
+
+    BRH_PROFILE_START(_brh_profile_vision_lighting, BRH_ZONE_VISION_LIGHTING);
+    if (compactVisibilityOnly) {
+        tmapAt(player.loc)->light[0] = minersLightColor.red;
+        tmapAt(player.loc)->light[1] = minersLightColor.green;
+        tmapAt(player.loc)->light[2] = minersLightColor.blue;
+        pmapAt(player.loc)->flags &= ~IS_IN_SHADOW;
+        player.info.foreColor = player.status[STATUS_INVISIBLE]
+            ? &playerInvisibleColor
+            : &playerInLightColor;
+    } else {
+        updateLighting();
+    }
+    BRH_PROFILE_END(BRH_ZONE_VISION_LIGHTING, _brh_profile_vision_lighting);
+
+    BRH_PROFILE_START(_brh_profile_vision_display, BRH_ZONE_VISION_DISPLAY);
+    if (compactVisibilityOnly) {
+        updateFieldOfViewDisplayCompactUnlit(visionFieldOfViewCells, visionFieldOfViewCellCount,
+                                            visionWasVisibleCells, visionWasVisibleCellCount,
+                                            refreshDisplay);
+    } else if (compactBridgeMode
+               && rogue.clairvoyance == 0
+               && !telepathyVisibleThisTurn
+               && !telepathyWasVisibleThisTurn) {
+        updateFieldOfViewDisplayCompact(visionFieldOfViewCells, visionFieldOfViewCellCount,
+                                       visionWasVisibleCells, visionWasVisibleCellCount,
+                                       refreshDisplay);
+    } else {
+        updateFieldOfViewDisplay(brh_bridge_should_refresh_dungeon_cell(), refreshDisplay);
+    }
+    BRH_PROFILE_END(BRH_ZONE_VISION_DISPLAY, _brh_profile_vision_display);
 
     //  for (i=0; i<DCOLS; i++) {
     //      for (j=0; j<DROWS; j++) {
@@ -799,6 +1101,7 @@ void updateVision(boolean refreshDisplay) {
             }
         }
     }
+    BRH_PROFILE_END(BRH_ZONE_UPDATE_VISION, _brh_profile_update_vision);
 }
 
 static void checkNutrition() {
@@ -1104,6 +1407,11 @@ void promoteTile(short x, short y, enum dungeonLayers layer, boolean useFireDF) 
     const floorTileType *tile;
 
     tile = &(tileCatalog[pmap[x][y].layers[layer]]);
+    markLightingMapDirty();
+    markEnvironmentTerrainCacheDirty();
+    if (layer == GAS) {
+        markVolumetricGasMapDirty();
+    }
 
     DFType = (useFireDF ? tile->fireType : tile->promoteType);
 
@@ -1166,6 +1474,9 @@ boolean exposeTileToFire(short x, short y, boolean alwaysIgnite) {
         return false;
     }
 
+    if (pmap[x][y].exposedToFire == 0 && exposedToFireCellCount < DCOLS * DROWS) {
+        exposedToFireCells[exposedToFireCellCount++] = (pos){ x, y };
+    }
     pmap[x][y].exposedToFire++;
 
     // Pick the extinguishing layer with the best priority.
@@ -1220,104 +1531,224 @@ boolean exposeTileToFire(short x, short y, boolean alwaysIgnite) {
     return fireIgnited;
 }
 
-// Only the gas layer can be volumetric.
-static void updateVolumetricMedia() {
-    short i, j, newX, newY, numSpaces;
+static void computeVolumetricGasForCell(short i, short j,
+                                        unsigned short newGasVolume[DCOLS][DROWS],
+                                        boolean *lightingDirty) {
+    short newX, newY, numSpaces;
     unsigned long highestNeighborVolume;
     unsigned long sum;
     enum tileType gasType;
     enum directions dir;
+
+    if (!terrainObstructsGasCache[i][j]) {
+        sum = pmap[i][j].volume;
+        numSpaces = 1;
+        highestNeighborVolume = pmap[i][j].volume;
+        gasType = pmap[i][j].layers[GAS];
+        for (dir=0; dir< DIRECTION_COUNT; dir++) {
+            newX = i + nbDirs[dir][0];
+            newY = j + nbDirs[dir][1];
+            if (coordinatesAreInMap(newX, newY)
+                && !terrainObstructsGasCache[newX][newY]) {
+
+                sum += pmap[newX][newY].volume;
+                numSpaces++;
+                if (pmap[newX][newY].volume > highestNeighborVolume) {
+                    highestNeighborVolume = pmap[newX][newY].volume;
+                    gasType = pmap[newX][newY].layers[GAS];
+                }
+            }
+        }
+        if (terrainAutoDescentCache[i][j]) { // if it's a chasm tile or trap door,
+            numSpaces++; // this will allow gas to escape from the level entirely
+        }
+        newGasVolume[i][j] += sum / max(1, numSpaces);
+        if ((unsigned) rand_range(0, numSpaces - 1) < (sum % numSpaces)) {
+            newGasVolume[i][j]++; // stochastic rounding
+        }
+        if (pmap[i][j].layers[GAS] != gasType && newGasVolume[i][j] > 3) {
+            if (pmap[i][j].layers[GAS] != NOTHING) {
+                newGasVolume[i][j] = min(3, newGasVolume[i][j]); // otherwise interactions between gases are crazy
+            }
+            pmap[i][j].layers[GAS] = gasType;
+            *lightingDirty = true;
+            markEnvironmentTerrainCacheDirtyForGasLayer();
+        } else if (pmap[i][j].layers[GAS] && newGasVolume[i][j] < 1) {
+            pmap[i][j].layers[GAS] = NOTHING;
+            *lightingDirty = true;
+            markEnvironmentTerrainCacheDirtyForGasLayer();
+            refreshDungeonCell((pos){ i, j });
+        }
+        if (pmap[i][j].volume > 0) {
+            if (tileCatalog[pmap[i][j].layers[GAS]].mechFlags & TM_GAS_DISSIPATES_QUICKLY) {
+                newGasVolume[i][j] -= (rand_percent(50) ? 1 : 0);
+            } else if (tileCatalog[pmap[i][j].layers[GAS]].mechFlags & TM_GAS_DISSIPATES) {
+                newGasVolume[i][j] -= (rand_percent(20) ? 1 : 0);
+            }
+        }
+    } else if (pmap[i][j].volume > 0) { // if has gas but can't hold gas,
+        // disperse gas instantly into neighboring tiles that can hold gas
+        numSpaces = 0;
+        for (dir = 0; dir < DIRECTION_COUNT; dir++) {
+            newX = i + nbDirs[dir][0];
+            newY = j + nbDirs[dir][1];
+            if (coordinatesAreInMap(newX, newY)
+                && !terrainObstructsGasCache[newX][newY]) {
+
+                numSpaces++;
+            }
+        }
+        if (numSpaces > 0) {
+            for (dir = 0; dir < DIRECTION_COUNT; dir++) {
+                newX = i + nbDirs[dir][0];
+                newY = j + nbDirs[dir][1];
+                if (coordinatesAreInMap(newX, newY)
+                    && !terrainObstructsGasCache[newX][newY]) {
+
+                    newGasVolume[newX][newY] += (pmap[i][j].volume / numSpaces);
+                    if (pmap[i][j].volume / numSpaces) {
+                        pmap[newX][newY].layers[GAS] = pmap[i][j].layers[GAS];
+                        *lightingDirty = true;
+                        markEnvironmentTerrainCacheDirtyForGasLayer();
+                    }
+                }
+            }
+        }
+        newGasVolume[i][j] = 0;
+        pmap[i][j].layers[GAS] = NOTHING;
+        *lightingDirty = true;
+        markEnvironmentTerrainCacheDirtyForGasLayer();
+    }
+}
+
+static void applyVolumetricGasForCell(short i, short j,
+                                      unsigned short newGasVolume[DCOLS][DROWS],
+                                      boolean *hasGas,
+                                      short *newMinX,
+                                      short *newMinY,
+                                      short *newMaxX,
+                                      short *newMaxY) {
+    if (pmap[i][j].volume != newGasVolume[i][j]) {
+        pmap[i][j].volume = newGasVolume[i][j];
+        refreshDungeonCell((pos){ i, j });
+    }
+    if (pmap[i][j].volume > 0 || pmap[i][j].layers[GAS]) {
+        *hasGas = true;
+        *newMinX = min(*newMinX, i);
+        *newMinY = min(*newMinY, j);
+        *newMaxX = max(*newMaxX, i);
+        *newMaxY = max(*newMaxY, j);
+        if (volumetricGasCellCount < DCOLS * DROWS) {
+            volumetricGasCells[volumetricGasCellCount++] = (pos){ i, j };
+        }
+    }
+}
+
+// Only the gas layer can be volumetric.
+static void updateVolumetricMedia() {
+    short i, j, idx;
+    short minX = DCOLS, minY = DROWS, maxX = -1, maxY = -1;
+    short newMinX = DCOLS, newMinY = DROWS, newMaxX = -1, newMaxY = -1;
+    pos cell;
     unsigned short newGasVolume[DCOLS][DROWS];
+    boolean hasGas = false;
+    boolean lightingDirty = false;
+    boolean useCandidateCells = false;
 
-    for (i=0; i<DCOLS; i++) {
-        for (j=0; j<DROWS; j++) {
-            newGasVolume[i][j] = 0;
+    ensureGasTerrainCache();
+
+    if (volumetricGasCellsKnown) {
+        buildVolumetricGasCandidatesFromActiveCells();
+        if (volumetricGasCandidateCellCount <= 0) {
+            volumetricGasCacheKnown = true;
+            volumetricGasCachePresent = false;
+            volumetricGasBoundsKnown = false;
+            volumetricGasCellsKnown = true;
+            volumetricGasCellCount = 0;
+            return;
+        }
+        useCandidateCells = true;
+    } else if (volumetricGasBoundsKnown) {
+        minX = volumetricGasMinX;
+        minY = volumetricGasMinY;
+        maxX = volumetricGasMaxX;
+        maxY = volumetricGasMaxY;
+    } else {
+        for (i=0; i<DCOLS; i++) {
+            for (j=0; j<DROWS; j++) {
+                if (pmap[i][j].volume > 0 || pmap[i][j].layers[GAS]) {
+                    minX = min(minX, i);
+                    minY = min(minY, j);
+                    maxX = max(maxX, i);
+                    maxY = max(maxY, j);
+                }
+            }
         }
     }
 
-    for (i=0; i<DCOLS; i++) {
-        for (j=0; j<DROWS; j++) {
-            if (!cellHasTerrainFlag((pos){ i, j }, T_OBSTRUCTS_GAS)) {
-                sum = pmap[i][j].volume;
-                numSpaces = 1;
-                highestNeighborVolume = pmap[i][j].volume;
-                gasType = pmap[i][j].layers[GAS];
-                for (dir=0; dir< DIRECTION_COUNT; dir++) {
-                    newX = i + nbDirs[dir][0];
-                    newY = j + nbDirs[dir][1];
-                    if (coordinatesAreInMap(newX, newY)
-                        && !cellHasTerrainFlag((pos){ newX, newY }, T_OBSTRUCTS_GAS)) {
+    if (!useCandidateCells && maxX < 0) {
+        volumetricGasCacheKnown = true;
+        volumetricGasCachePresent = false;
+        volumetricGasBoundsKnown = false;
+        volumetricGasCellsKnown = true;
+        volumetricGasCellCount = 0;
+        return;
+    }
 
-                        sum += pmap[newX][newY].volume;
-                        numSpaces++;
-                        if (pmap[newX][newY].volume > highestNeighborVolume) {
-                            highestNeighborVolume = pmap[newX][newY].volume;
-                            gasType = pmap[newX][newY].layers[GAS];
-                        }
-                    }
-                }
-                if (cellHasTerrainFlag((pos){ i, j }, T_AUTO_DESCENT)) { // if it's a chasm tile or trap door,
-                    numSpaces++; // this will allow gas to escape from the level entirely
-                }
-                newGasVolume[i][j] += sum / max(1, numSpaces);
-                if ((unsigned) rand_range(0, numSpaces - 1) < (sum % numSpaces)) {
-                    newGasVolume[i][j]++; // stochastic rounding
-                }
-                if (pmap[i][j].layers[GAS] != gasType && newGasVolume[i][j] > 3) {
-                    if (pmap[i][j].layers[GAS] != NOTHING) {
-                        newGasVolume[i][j] = min(3, newGasVolume[i][j]); // otherwise interactions between gases are crazy
-                    }
-                    pmap[i][j].layers[GAS] = gasType;
-                } else if (pmap[i][j].layers[GAS] && newGasVolume[i][j] < 1) {
-                    pmap[i][j].layers[GAS] = NOTHING;
-                    refreshDungeonCell((pos){ i, j });
-                }
-                if (pmap[i][j].volume > 0) {
-                    if (tileCatalog[pmap[i][j].layers[GAS]].mechFlags & TM_GAS_DISSIPATES_QUICKLY) {
-                        newGasVolume[i][j] -= (rand_percent(50) ? 1 : 0);
-                    } else if (tileCatalog[pmap[i][j].layers[GAS]].mechFlags & TM_GAS_DISSIPATES) {
-                        newGasVolume[i][j] -= (rand_percent(20) ? 1 : 0);
-                    }
-                }
-            } else if (pmap[i][j].volume > 0) { // if has gas but can't hold gas,
-                // disperse gas instantly into neighboring tiles that can hold gas
-                numSpaces = 0;
-                for (dir = 0; dir < DIRECTION_COUNT; dir++) {
-                    newX = i + nbDirs[dir][0];
-                    newY = j + nbDirs[dir][1];
-                    if (coordinatesAreInMap(newX, newY)
-                        && !cellHasTerrainFlag((pos){ newX, newY }, T_OBSTRUCTS_GAS)) {
+    if (useCandidateCells) {
+        for (idx=0; idx<volumetricGasCandidateCellCount; idx++) {
+            cell = volumetricGasCandidateCells[idx];
+            newGasVolume[cell.x][cell.y] = 0;
+        }
+        for (idx=0; idx<volumetricGasCandidateCellCount; idx++) {
+            cell = volumetricGasCandidateCells[idx];
+            computeVolumetricGasForCell(cell.x, cell.y, newGasVolume, &lightingDirty);
+        }
+        volumetricGasCellCount = 0;
+        for (idx=0; idx<volumetricGasCandidateCellCount; idx++) {
+            cell = volumetricGasCandidateCells[idx];
+            applyVolumetricGasForCell(cell.x, cell.y, newGasVolume, &hasGas,
+                                      &newMinX, &newMinY, &newMaxX, &newMaxY);
+        }
+    } else {
+        minX = max(0, minX - 1);
+        minY = max(0, minY - 1);
+        maxX = min(DCOLS - 1, maxX + 1);
+        maxY = min(DROWS - 1, maxY + 1);
 
-                        numSpaces++;
-                    }
-                }
-                if (numSpaces > 0) {
-                    for (dir = 0; dir < DIRECTION_COUNT; dir++) {
-                        newX = i + nbDirs[dir][0];
-                        newY = j + nbDirs[dir][1];
-                        if (coordinatesAreInMap(newX, newY)
-                            && !cellHasTerrainFlag((pos){ newX, newY }, T_OBSTRUCTS_GAS)) {
-
-                            newGasVolume[newX][newY] += (pmap[i][j].volume / numSpaces);
-                            if (pmap[i][j].volume / numSpaces) {
-                                pmap[newX][newY].layers[GAS] = pmap[i][j].layers[GAS];
-                            }
-                        }
-                    }
-                }
+        for (i=minX; i<=maxX; i++) {
+            for (j=minY; j<=maxY; j++) {
                 newGasVolume[i][j] = 0;
-                pmap[i][j].layers[GAS] = NOTHING;
+            }
+        }
+        for (i=minX; i<=maxX; i++) {
+            for (j=minY; j<=maxY; j++) {
+                computeVolumetricGasForCell(i, j, newGasVolume, &lightingDirty);
+            }
+        }
+        volumetricGasCellCount = 0;
+        for (i=minX; i<=maxX; i++) {
+            for (j=minY; j<=maxY; j++) {
+                applyVolumetricGasForCell(i, j, newGasVolume, &hasGas,
+                                          &newMinX, &newMinY, &newMaxX, &newMaxY);
             }
         }
     }
 
-    for (i=0; i<DCOLS; i++) {
-        for (j=0; j<DROWS; j++) {
-            if (pmap[i][j].volume != newGasVolume[i][j]) {
-                pmap[i][j].volume = newGasVolume[i][j];
-                refreshDungeonCell((pos){ i, j });
-            }
-        }
+    volumetricGasCacheKnown = true;
+    volumetricGasCachePresent = hasGas;
+    volumetricGasCellsKnown = true;
+    if (hasGas) {
+        volumetricGasBoundsKnown = true;
+        volumetricGasMinX = newMinX;
+        volumetricGasMinY = newMinY;
+        volumetricGasMaxX = newMaxX;
+        volumetricGasMaxY = newMaxY;
+    } else {
+        volumetricGasBoundsKnown = false;
+    }
+    if (lightingDirty) {
+        markLightingMapDirty();
     }
 }
 
@@ -1410,113 +1841,174 @@ void monstersFall() {
 }
 
 void updateEnvironment() {
-    short i, j, direction, newX, newY, promotions[DCOLS][DROWS];
+    short i, j, direction, newX, newY, idx, writeIndex;
+    short promotionMasks[DCOLS * DROWS];
     long promoteChance;
     enum dungeonLayers layer;
     const floorTileType *tile;
+    pos cell;
     boolean isVolumetricGas = false;
+    boolean compactBridgeMode = !brh_bridge_should_refresh_dungeon_cell();
+    BRH_PROFILE_START(_brh_profile_update_environment, BRH_ZONE_UPDATE_ENVIRONMENT);
 
+    BRH_PROFILE_START(_brh_profile_env_fall, BRH_ZONE_ENV_FALL);
     monstersFall();
+    BRH_PROFILE_END(BRH_ZONE_ENV_FALL, _brh_profile_env_fall);
 
     // reset exposedToFire
-    for (i=0; i<DCOLS; i++) {
-        for (j=0; j<DROWS; j++) {
-            pmap[i][j].exposedToFire = 0;
+    BRH_PROFILE_START(_brh_profile_env_reset_fire, BRH_ZONE_ENV_RESET_FIRE);
+    for (idx=0; idx<exposedToFireCellCount; idx++) {
+        cell = exposedToFireCells[idx];
+        pmap[cell.x][cell.y].exposedToFire = 0;
+    }
+    exposedToFireCellCount = 0;
+    BRH_PROFILE_END(BRH_ZONE_ENV_RESET_FIRE, _brh_profile_env_reset_fire);
+
+    if (compactBridgeMode) {
+        BRH_PROFILE_START(_brh_profile_env_bookkeeping, BRH_ZONE_ENV_BOOKKEEPING);
+        for (idx=0; idx<caughtFireCellCount; idx++) {
+            cell = caughtFireCells[idx];
+            pmap[cell.x][cell.y].flags &= ~(CAUGHT_FIRE_THIS_TURN);
         }
+        caughtFireCellCount = 0;
+
+        for (idx=0, writeIndex=0; idx<depressedPressurePlateCellCount; idx++) {
+            cell = depressedPressurePlateCells[idx];
+            if (!(pmap[cell.x][cell.y].flags & PRESSURE_PLATE_DEPRESSED)) {
+                continue;
+            }
+            if (!(pmap[cell.x][cell.y].flags & (HAS_PLAYER | HAS_MONSTER | HAS_ITEM))) {
+                pmap[cell.x][cell.y].flags &= ~PRESSURE_PLATE_DEPRESSED;
+                continue;
+            }
+            depressedPressurePlateCells[writeIndex++] = cell;
+        }
+        depressedPressurePlateCellCount = writeIndex;
+        BRH_PROFILE_END(BRH_ZONE_ENV_BOOKKEEPING, _brh_profile_env_bookkeeping);
+        BRH_PROFILE_END(BRH_ZONE_UPDATE_ENVIRONMENT, _brh_profile_update_environment);
+        return;
     }
 
     // update gases twice
-    for (i=0; i<DCOLS && !isVolumetricGas; i++) {
-        for (j=0; j<DROWS && !isVolumetricGas; j++) {
-            if (!isVolumetricGas && pmap[i][j].layers[GAS]) {
-                isVolumetricGas = true;
-            }
-        }
-    }
+    BRH_PROFILE_START(_brh_profile_env_gas, BRH_ZONE_ENV_GAS);
+    isVolumetricGas = levelHasVolumetricGas();
     if (isVolumetricGas) {
         updateVolumetricMedia();
         updateVolumetricMedia();
     }
+    BRH_PROFILE_END(BRH_ZONE_ENV_GAS, _brh_profile_env_gas);
 
     // Do random tile promotions in two passes to keep generations distinct.
     // First pass, make a note of each terrain layer at each coordinate that is going to promote:
-    for (i=0; i<DCOLS; i++) {
-        for (j=0; j<DROWS; j++) {
-            promotions[i][j] = 0;
-            for (layer = 0; layer < NUMBER_TERRAIN_LAYERS; layer++) {
-                tile = &(tileCatalog[pmap[i][j].layers[layer]]);
-                if (tile->promoteChance < 0) {
-                    promoteChance = 0;
-                    for (direction = 0; direction < 4; direction++) {
-                        if (coordinatesAreInMap(i + nbDirs[direction][0], j + nbDirs[direction][1])
-                            && !cellHasTerrainFlag((pos){ i + nbDirs[direction][0], j + nbDirs[direction][1] }, T_OBSTRUCTS_PASSABILITY)
-                            && pmap[i + nbDirs[direction][0]][j + nbDirs[direction][1]].layers[layer] != pmap[i][j].layers[layer]
-                            && !(pmap[i][j].flags & CAUGHT_FIRE_THIS_TURN)) {
-                            promoteChance += -1 * tile->promoteChance;
-                        }
+    BRH_PROFILE_START(_brh_profile_env_promotions, BRH_ZONE_ENV_PROMOTIONS);
+    ensureEnvironmentTerrainCache();
+    for (idx=0; idx<promotableCellCount; idx++) {
+        cell = promotableCells[idx];
+        i = cell.x;
+        j = cell.y;
+        promotionMasks[idx] = 0;
+        for (layer = 0; layer < NUMBER_TERRAIN_LAYERS; layer++) {
+            tile = &(tileCatalog[pmap[i][j].layers[layer]]);
+            if (tile->promoteChance < 0) {
+                promoteChance = 0;
+                for (direction = 0; direction < 4; direction++) {
+                    if (coordinatesAreInMap(i + nbDirs[direction][0], j + nbDirs[direction][1])
+                        && !(environmentTerrainFlagsCache[i + nbDirs[direction][0]][j + nbDirs[direction][1]] & T_OBSTRUCTS_PASSABILITY)
+                        && pmap[i + nbDirs[direction][0]][j + nbDirs[direction][1]].layers[layer] != pmap[i][j].layers[layer]
+                        && !(pmap[i][j].flags & CAUGHT_FIRE_THIS_TURN)) {
+                        promoteChance += -1 * tile->promoteChance;
                     }
-                } else {
-                    promoteChance = tile->promoteChance;
                 }
-                if (promoteChance
-                    && !(pmap[i][j].flags & CAUGHT_FIRE_THIS_TURN)
-                    && rand_range(0, 10000) < promoteChance) {
-                    promotions[i][j] |= Fl(layer);
-                    //promoteTile(i, j, layer, false);
-                }
+            } else {
+                promoteChance = tile->promoteChance;
+            }
+            if (promoteChance
+                && !(pmap[i][j].flags & CAUGHT_FIRE_THIS_TURN)
+                && rand_range(0, 10000) < promoteChance) {
+                promotionMasks[idx] |= Fl(layer);
+                //promoteTile(i, j, layer, false);
             }
         }
     }
     // Second pass, do the promotions:
-    for (i=0; i<DCOLS; i++) {
-        for (j=0; j<DROWS; j++) {
+    for (idx=0; idx<promotableCellCount; idx++) {
+        if (!promotionMasks[idx]) {
+            continue;
+        }
+        cell = promotableCells[idx];
+        i = cell.x;
+        j = cell.y;
+        for (layer = 0; layer < NUMBER_TERRAIN_LAYERS; layer++) {
+            if ((promotionMasks[idx] & Fl(layer))) {
+                //&& (tileCatalog[pmap[i][j].layers[layer]].promoteChance != 0)){
+                // make sure that it's still a promotable layer
+                promoteTile(i, j, layer, false);
+            }
+        }
+    }
+    ensureEnvironmentTerrainCache();
+    BRH_PROFILE_END(BRH_ZONE_ENV_PROMOTIONS, _brh_profile_env_promotions);
+
+    // Bookkeeping for fire, pressure plates and key-activated tiles.
+    BRH_PROFILE_START(_brh_profile_env_bookkeeping, BRH_ZONE_ENV_BOOKKEEPING);
+    for (idx=0; idx<caughtFireCellCount; idx++) {
+        cell = caughtFireCells[idx];
+        pmap[cell.x][cell.y].flags &= ~(CAUGHT_FIRE_THIS_TURN);
+    }
+    caughtFireCellCount = 0;
+
+    for (idx=0, writeIndex=0; idx<depressedPressurePlateCellCount; idx++) {
+        cell = depressedPressurePlateCells[idx];
+        if (!(pmap[cell.x][cell.y].flags & PRESSURE_PLATE_DEPRESSED)) {
+            continue;
+        }
+        if (!(pmap[cell.x][cell.y].flags & (HAS_PLAYER | HAS_MONSTER | HAS_ITEM))) {
+            pmap[cell.x][cell.y].flags &= ~PRESSURE_PLATE_DEPRESSED;
+            continue;
+        }
+        depressedPressurePlateCells[writeIndex++] = cell;
+    }
+    depressedPressurePlateCellCount = writeIndex;
+
+    for (idx=0; idx<keylessPromotionCellCount; idx++) {
+        cell = keylessPromotionCells[idx];
+        i = cell.x;
+        j = cell.y;
+        if (cellHasTMFlag((pos){ i, j }, TM_PROMOTES_WITHOUT_KEY) && !keyOnTileAt((pos){ i, j })) {
             for (layer = 0; layer < NUMBER_TERRAIN_LAYERS; layer++) {
-                if ((promotions[i][j] & Fl(layer))) {
-                    //&& (tileCatalog[pmap[i][j].layers[layer]].promoteChance != 0)){
-                    // make sure that it's still a promotable layer
+                if (tileCatalog[pmap[i][j].layers[layer]].mechFlags & TM_PROMOTES_WITHOUT_KEY) {
                     promoteTile(i, j, layer, false);
                 }
             }
         }
     }
-
-    // Bookkeeping for fire, pressure plates and key-activated tiles.
-    for (i=0; i<DCOLS; i++) {
-        for (j=0; j<DROWS; j++) {
-            pmap[i][j].flags &= ~(CAUGHT_FIRE_THIS_TURN);
-            if (!(pmap[i][j].flags & (HAS_PLAYER | HAS_MONSTER | HAS_ITEM))
-                && (pmap[i][j].flags & PRESSURE_PLATE_DEPRESSED)) {
-
-                pmap[i][j].flags &= ~PRESSURE_PLATE_DEPRESSED;
-            }
-            if (cellHasTMFlag((pos){ i, j }, TM_PROMOTES_WITHOUT_KEY) && !keyOnTileAt((pos){ i, j })) {
-                for (layer = 0; layer < NUMBER_TERRAIN_LAYERS; layer++) {
-                    if (tileCatalog[pmap[i][j].layers[layer]].mechFlags & TM_PROMOTES_WITHOUT_KEY) {
-                        promoteTile(i, j, layer, false);
-                    }
-                }
-            }
-        }
-    }
+    ensureEnvironmentTerrainCache();
+    BRH_PROFILE_END(BRH_ZONE_ENV_BOOKKEEPING, _brh_profile_env_bookkeeping);
 
     // Update fire.
-    for (i=0; i<DCOLS; i++) {
-        for (j=0; j<DROWS; j++) {
-            if (cellHasTerrainFlag((pos){ i, j }, T_IS_FIRE) && !(pmap[i][j].flags & CAUGHT_FIRE_THIS_TURN)) {
-                exposeTileToFire(i, j, false);
-                for (direction=0; direction<4; direction++) {
-                    newX = i + nbDirs[direction][0];
-                    newY = j + nbDirs[direction][1];
-                    if (coordinatesAreInMap(newX, newY)) {
-                        exposeTileToFire(newX, newY, false);
-                    }
+    BRH_PROFILE_START(_brh_profile_env_fire, BRH_ZONE_ENV_FIRE);
+    for (idx=0; idx<fireCellCount; idx++) {
+        cell = fireCells[idx];
+        i = cell.x;
+        j = cell.y;
+        if (cellHasTerrainFlag((pos){ i, j }, T_IS_FIRE) && !(pmap[i][j].flags & CAUGHT_FIRE_THIS_TURN)) {
+            exposeTileToFire(i, j, false);
+            for (direction=0; direction<4; direction++) {
+                newX = i + nbDirs[direction][0];
+                newY = j + nbDirs[direction][1];
+                if (coordinatesAreInMap(newX, newY)) {
+                    exposeTileToFire(newX, newY, false);
                 }
             }
         }
     }
+    BRH_PROFILE_END(BRH_ZONE_ENV_FIRE, _brh_profile_env_fire);
 
     // Terrain that affects items and vice versa
+    BRH_PROFILE_START(_brh_profile_env_floor_items, BRH_ZONE_ENV_FLOOR_ITEMS);
     updateFloorItems();
+    BRH_PROFILE_END(BRH_ZONE_ENV_FLOOR_ITEMS, _brh_profile_env_floor_items);
+    BRH_PROFILE_END(BRH_ZONE_UPDATE_ENVIRONMENT, _brh_profile_update_environment);
 }
 
 void updateAllySafetyMap() {
@@ -2086,6 +2578,7 @@ static boolean dangerChanged(boolean danger[4]) {
 
 void autoRest() {
     boolean danger[4];
+    BRH_PROFILE_START(_brh_profile_auto_rest, BRH_ZONE_AUTO_REST);
     for (enum directions dir = 0; dir < 4; dir++) {
         const pos newLoc = posNeighborInDirection(player.loc, dir);
         danger[dir] = monsterAvoids(&player, newLoc);
@@ -2141,9 +2634,11 @@ void autoRest() {
         }
     }
     rogue.automationActive = false;
+    BRH_PROFILE_END(BRH_ZONE_AUTO_REST, _brh_profile_auto_rest);
 }
 
 void manualSearch() {
+    BRH_PROFILE_START(_brh_profile_manual_search, BRH_ZONE_MANUAL_SEARCH);
     recordKeystroke(SEARCH_KEY, false, false);
 
     if (player.status[STATUS_SEARCHING] <= 0) {
@@ -2180,6 +2675,7 @@ void manualSearch() {
 
     rogue.justSearched = true;
     playerTurnEnded();
+    BRH_PROFILE_END(BRH_ZONE_MANUAL_SEARCH, _brh_profile_manual_search);
 }
 
 // Call this periodically (when haste/slow wears off and when moving between depths)
@@ -2212,6 +2708,135 @@ static void recordCurrentCreatureHealths() {
     }
 }
 
+static boolean playerTurnEndedCompactFast() {
+    short elapsedTicks;
+
+    if (brh_bridge_should_refresh_dungeon_cell()
+        || rogue.playbackMode
+        || rogue.automationActive
+        || rogue.gameHasEnded
+        || (player.bookkeepingFlags & MB_IS_FALLING)
+        || player.status[STATUS_PARALYZED]
+        || player.status[STATUS_BURNING]
+        || player.status[STATUS_POISONED]
+        || player.status[STATUS_STUCK]
+        || player.status[STATUS_NAUSEOUS]
+        || player.status[STATUS_CONFUSED]
+        || player.status[STATUS_SEARCHING]
+        || player.status[STATUS_TELEPATHIC]
+        || player.status[STATUS_HALLUCINATING]
+        || player.status[STATUS_LEVITATING]
+        || player.status[STATUS_AGGRAVATING]) {
+
+        return false;
+    }
+
+    handleXPXP();
+    resetDFMessageEligibility();
+
+    rogue.playerTurnNumber++;
+    rogue.absoluteTurnNumber++;
+
+    if (player.status[STATUS_INVISIBLE]) {
+        rogue.scentTurnNumber += 10;
+    } else {
+        rogue.scentTurnNumber += 3;
+    }
+    if (rogue.scentTurnNumber > 20000) {
+        resetScentTurnNumber();
+    }
+
+    if (player.status[STATUS_NUTRITION] <= 0) {
+        player.currentHP--;
+        if (player.currentHP <= 0) {
+            gameOver("Starved to death", true);
+            return true;
+        }
+    } else if (player.currentHP < player.info.maxHP
+               && !player.status[STATUS_POISONED]) {
+        if ((player.turnsUntilRegen -= 1000) <= 0) {
+            player.currentHP++;
+            if (player.previousHealthPoints < player.currentHP) {
+                player.previousHealthPoints++;
+            }
+            player.turnsUntilRegen += player.info.turnsBetweenRegen;
+        }
+        if (player.regenPerTurn) {
+            player.currentHP += player.regenPerTurn;
+            if (player.previousHealthPoints < player.currentHP) {
+                player.previousHealthPoints = min(player.currentHP, player.previousHealthPoints + player.regenPerTurn);
+            }
+        }
+    }
+
+    if (rogue.awarenessBonus > -30 && !(pmapAt(player.loc)->flags & SEARCHED_FROM_HERE)) {
+        search(rogue.awarenessBonus + 30);
+        pmapAt(player.loc)->flags |= SEARCHED_FROM_HERE;
+    }
+    if (rogue.staleLoopMap) {
+        analyzeMap(false);
+    }
+
+    if (player.ticksUntilTurn == 0) {
+        player.ticksUntilTurn += player.movementSpeed;
+    } else if (player.ticksUntilTurn < 0) {
+        player.ticksUntilTurn = 0;
+    }
+    elapsedTicks = player.ticksUntilTurn;
+
+    applyGradualTileEffectsToCreature(&player, elapsedTicks);
+    if (rogue.gameHasEnded) {
+        return true;
+    }
+
+    BRH_PROFILE_START(_brh_profile_turn_schedule_loop, BRH_ZONE_TURN_SCHEDULE_LOOP);
+    rogue.ticksTillUpdateEnvironment -= elapsedTicks;
+    while (rogue.ticksTillUpdateEnvironment <= 0) {
+        rogue.ticksTillUpdateEnvironment += 100;
+        rechargeItemsIncrementally(1);
+        processIncrementalAutoID();
+        rogue.monsterSpawnFuse--;
+
+        BRH_PROFILE_START(_brh_profile_update_environment, BRH_ZONE_UPDATE_ENVIRONMENT);
+        updateEnvironment();
+        BRH_PROFILE_END(BRH_ZONE_UPDATE_ENVIRONMENT, _brh_profile_update_environment);
+
+        decrementPlayerStatus();
+        applyInstantTileEffectsToCreature(&player);
+        if (rogue.gameHasEnded) {
+            BRH_PROFILE_END(BRH_ZONE_TURN_SCHEDULE_LOOP, _brh_profile_turn_schedule_loop);
+            return true;
+        }
+    }
+    player.ticksUntilTurn = 0;
+    BRH_PROFILE_END(BRH_ZONE_TURN_SCHEDULE_LOOP, _brh_profile_turn_schedule_loop);
+
+    updateVision(true);
+    rogue.stealthRange = currentStealthRange();
+
+    applyInstantTileEffectsToCreature(&player);
+    if (rogue.gameHasEnded) {
+        return true;
+    }
+
+    if (player.currentHP > player.info.maxHP) {
+        player.currentHP = player.info.maxHP;
+    }
+
+    if (player.bookkeepingFlags & MB_IS_FALLING) {
+        playerFalls();
+        handleHealthAlerts();
+        return true;
+    }
+
+    rogue.justRested = false;
+    rogue.justSearched = false;
+    rogue.playbackBetweenTurns = true;
+    RNGCheck();
+    handleHealthAlerts();
+    return true;
+}
+
 // This is the dungeon schedule manager, called every time the player's turn comes to an end.
 // It hands control over to monsters until they've all expended their accumulated ticks,
 // updating the environment (gas spreading, flames spreading and burning out, etc.) every
@@ -2221,8 +2846,14 @@ void playerTurnEnded() {
     char buf[COLS], buf2[COLS];
     boolean fastForward = false;
     short oldRNG;
+    BRH_PROFILE_START(_brh_profile_player_turn_ended, BRH_ZONE_PLAYER_TURN_ENDED);
 
     brogueAssert(rogue.RNG == RNG_SUBSTANTIVE);
+
+    if (playerTurnEndedCompactFast()) {
+        BRH_PROFILE_END(BRH_ZONE_PLAYER_TURN_ENDED, _brh_profile_player_turn_ended);
+        return;
+    }
 
     handleXPXP();
     resetDFMessageEligibility();
@@ -2233,6 +2864,7 @@ void playerTurnEnded() {
         if (!rogue.gameHasEnded) {
             handleHealthAlerts();
         }
+        BRH_PROFILE_END(BRH_ZONE_PLAYER_TURN_ENDED, _brh_profile_player_turn_ended);
         return;
     }
 
@@ -2244,6 +2876,7 @@ void playerTurnEnded() {
 
     do {
         if (rogue.gameHasEnded) {
+            BRH_PROFILE_END(BRH_ZONE_PLAYER_TURN_ENDED, _brh_profile_player_turn_ended);
             return;
         }
 
@@ -2268,6 +2901,7 @@ void playerTurnEnded() {
             player.currentHP--;
             if (player.currentHP <= 0) {
                 gameOver("Starved to death", true);
+                BRH_PROFILE_END(BRH_ZONE_PLAYER_TURN_ENDED, _brh_profile_player_turn_ended);
                 return;
             }
         } else if (player.currentHP < player.info.maxHP
@@ -2343,7 +2977,9 @@ void playerTurnEnded() {
             player.ticksUntilTurn = 0;
         }
 
+        BRH_PROFILE_START(_brh_profile_turn_update_scent, BRH_ZONE_TURN_UPDATE_SCENT);
         updateScent();
+        BRH_PROFILE_END(BRH_ZONE_TURN_UPDATE_SCENT, _brh_profile_turn_update_scent);
 //      updateVision(true);
 //        rogue.stealthRange = currentStealthRange();
 //        if (rogue.displayStealthRangeMode) {
@@ -2368,11 +3004,13 @@ void playerTurnEnded() {
         applyGradualTileEffectsToCreature(&player, player.ticksUntilTurn);
 
         if (rogue.gameHasEnded) {
+            BRH_PROFILE_END(BRH_ZONE_PLAYER_TURN_ENDED, _brh_profile_player_turn_ended);
             return;
         }
 
         rogue.heardCombatThisTurn = false;
 
+        BRH_PROFILE_START(_brh_profile_turn_schedule_loop, BRH_ZONE_TURN_SCHEDULE_LOOP);
         while (player.ticksUntilTurn > 0) {
             soonestTurn = 10000;
             for (creatureIterator it = iterateCreatures(monsters); hasNextCreature(it);) {
@@ -2420,6 +3058,8 @@ void playerTurnEnded() {
                 decrementPlayerStatus();
                 applyInstantTileEffectsToCreature(&player);
                 if (rogue.gameHasEnded) { // caustic gas, lava, trapdoor, etc.
+                    BRH_PROFILE_END(BRH_ZONE_TURN_SCHEDULE_LOOP, _brh_profile_turn_schedule_loop);
+                    BRH_PROFILE_END(BRH_ZONE_PLAYER_TURN_ENDED, _brh_profile_player_turn_ended);
                     return;
                 }
                 monstersApproachStairs();
@@ -2429,11 +3069,16 @@ void playerTurnEnded() {
                 }
 
                 // Rolling waypoint refresh:
-                rogue.wpRefreshTicker++;
-                if (rogue.wpRefreshTicker >= rogue.wpCount) {
-                    rogue.wpRefreshTicker = 0;
+                if (brh_bridge_should_refresh_dungeon_cell()) {
+                    rogue.wpRefreshTicker++;
+                    if (rogue.wpRefreshTicker >= rogue.wpCount) {
+                        rogue.wpRefreshTicker = 0;
+                    }
+                    refreshWaypoint(rogue.wpRefreshTicker);
+                } else {
+                    waypointRefreshDirty = false;
+                    waypointRefreshRemaining = 0;
                 }
-                refreshWaypoint(rogue.wpRefreshTicker);
             }
 
             for (creatureIterator it = iterateCreatures(monsters); hasNextCreature(it) && rogue.gameHasEnded == false;) {
@@ -2451,7 +3096,9 @@ void playerTurnEnded() {
                         // Do not pass go; do not collect 200 gold.
                         monst->ticksUntilTurn = monst->movementSpeed;
                     } else {
+                        BRH_PROFILE_START(_brh_profile_monsters_turn, BRH_ZONE_MONSTERS_TURN);
                         monstersTurn(monst);
+                        BRH_PROFILE_END(BRH_ZONE_MONSTERS_TURN, _brh_profile_monsters_turn);
                     }
 
                     for (creatureIterator it2 = iterateCreatures(monsters); hasNextCreature(it2);) {
@@ -2467,9 +3114,12 @@ void playerTurnEnded() {
             player.ticksUntilTurn -= soonestTurn;
 
             if (rogue.gameHasEnded) {
+                BRH_PROFILE_END(BRH_ZONE_TURN_SCHEDULE_LOOP, _brh_profile_turn_schedule_loop);
+                BRH_PROFILE_END(BRH_ZONE_PLAYER_TURN_ENDED, _brh_profile_player_turn_ended);
                 return;
             }
         }
+        BRH_PROFILE_END(BRH_ZONE_TURN_SCHEDULE_LOOP, _brh_profile_turn_schedule_loop);
         // DEBUG displayLevel();
         //checkForDungeonErrors();
 
@@ -2479,6 +3129,7 @@ void playerTurnEnded() {
             displayLevel();
         }
 
+        BRH_PROFILE_START(_brh_profile_turn_post_vision, BRH_ZONE_TURN_POST_VISION);
         for (creatureIterator it = iterateCreatures(monsters); hasNextCreature(it);) {
             creature *monst = nextCreature(&it);
             if (canSeeMonster(monst) && !(monst->bookkeepingFlags & (MB_WAS_VISIBLE | MB_ALREADY_SEEN))) {
@@ -2561,9 +3212,11 @@ void playerTurnEnded() {
         displayAnnotation();
 
         refreshSideBar(-1, -1, false);
+        BRH_PROFILE_END(BRH_ZONE_TURN_POST_VISION, _brh_profile_turn_post_vision);
 
         applyInstantTileEffectsToCreature(&player);
         if (rogue.gameHasEnded) { // caustic gas, lava, trapdoor, etc.
+            BRH_PROFILE_END(BRH_ZONE_PLAYER_TURN_ENDED, _brh_profile_player_turn_ended);
             return;
         }
 
@@ -2574,6 +3227,7 @@ void playerTurnEnded() {
         if (player.bookkeepingFlags & MB_IS_FALLING) {
             playerFalls();
             handleHealthAlerts();
+            BRH_PROFILE_END(BRH_ZONE_PLAYER_TURN_ENDED, _brh_profile_player_turn_ended);
             return;
         }
 
@@ -2581,6 +3235,7 @@ void playerTurnEnded() {
 
     rogue.justRested = false;
     rogue.justSearched = false;
+    BRH_PROFILE_START(_brh_profile_turn_end_bookkeeping, BRH_ZONE_TURN_END_BOOKKEEPING);
     updateFlavorText();
 
     if (!rogue.updatedMapToShoreThisTurn) {
@@ -2619,6 +3274,8 @@ void playerTurnEnded() {
         animateFlares(rogue.flares, rogue.flareCount);
         rogue.flareCount = 0;
     }
+    BRH_PROFILE_END(BRH_ZONE_TURN_END_BOOKKEEPING, _brh_profile_turn_end_bookkeeping);
+    BRH_PROFILE_END(BRH_ZONE_PLAYER_TURN_ENDED, _brh_profile_player_turn_ended);
 }
 
 void resetScentTurnNumber() { // don't want player.scentTurnNumber to roll over the short maxint!

@@ -1,5 +1,7 @@
 *.o
 bin/*.brogue*
+bin/libbruhogue_*.so
+bin/libbruhogue_*.dylib
 bin/BrogueHighScores.txt
 bin/brogue*
 bin/*.png

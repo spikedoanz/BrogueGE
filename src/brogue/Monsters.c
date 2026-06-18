@@ -3771,6 +3771,7 @@ boolean moveMonster(creature *monst, short dx, short dy) {
             return true;
         } else if (tileCatalog[pmap[x][y].layers[SURFACE]].flags & T_ENTANGLES) {
             pmap[x][y].layers[SURFACE] = NOTHING;
+            markEnvironmentTerrainCacheDirty();
         }
     }
 

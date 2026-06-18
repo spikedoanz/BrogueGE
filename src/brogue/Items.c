@@ -440,7 +440,7 @@ item *placeItemAt(item *theItem, pos dest) {
         && !cellHasTerrainFlag(dest, T_MOVES_ITEMS)
         && !(pmapAt(dest)->flags & PRESSURE_PLATE_DEPRESSED)) {
 
-        pmapAt(dest)->flags |= PRESSURE_PLATE_DEPRESSED;
+        markPressurePlateDepressed(dest.x, dest.y);
         if (playerCanSee(dest.x, dest.y)) {
             if (cellHasTMFlag(dest, TM_IS_SECRET)) {
                 discover(dest.x, dest.y);
@@ -3641,11 +3641,13 @@ static boolean tunnelize(short x, short y) {
     freeCaptivesEmbeddedAt(x, y);
     if (x == 0 || x == DCOLS - 1 || y == 0 || y == DROWS - 1) {
         pmap[x][y].layers[DUNGEON] = CRYSTAL_WALL; // don't dissolve the boundary walls
+        markEnvironmentTerrainCacheDirty();
         didSomething = true;
     } else {
         for (layer = 0; layer < NUMBER_TERRAIN_LAYERS; layer++) {
             if (tileCatalog[pmap[x][y].layers[layer]].flags & (T_OBSTRUCTS_PASSABILITY | T_OBSTRUCTS_VISION)) {
                 pmap[x][y].layers[layer] = (layer == DUNGEON ? FLOOR : NOTHING);
+                markEnvironmentTerrainCacheDirty();
                 didSomething = true;
             }
         }
@@ -4160,6 +4162,7 @@ static void crystalize(short radius) {
                 if (tileCatalog[pmap[i][j].layers[DUNGEON]].flags & (T_OBSTRUCTS_PASSABILITY | T_OBSTRUCTS_VISION)) {
 
                     pmap[i][j].layers[DUNGEON] = FORCEFIELD;
+                    markEnvironmentTerrainCacheDirty();
                     spawnDungeonFeature(i, j, &dungeonFeatureCatalog[DF_SHATTERING_SPELL], true, false);
 
                     if (pmap[i][j].flags & HAS_MONSTER) {
@@ -4173,6 +4176,7 @@ static void crystalize(short radius) {
                     }
                     if (i == 0 || i == DCOLS - 1 || j == 0 || j == DROWS - 1) {
                         pmap[i][j].layers[DUNGEON] = CRYSTAL_WALL; // boundary walls turn to crystal
+                        markEnvironmentTerrainCacheDirty();
                     }
                 }
             }

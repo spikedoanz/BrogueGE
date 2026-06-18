@@ -24,6 +24,66 @@
 #include "Rogue.h"
 #include "GlobalsBase.h"
 #include "Globals.h"
+#include "bridge-profile.h"
+
+typedef struct glowCacheEntry {
+    short x;
+    short y;
+    enum dungeonLayers layer;
+} glowCacheEntry;
+
+static glowCacheEntry glowCache[DCOLS * DROWS * NUMBER_TERRAIN_LAYERS];
+static int glowCacheCount = 0;
+static boolean glowCacheDirty = true;
+static fixpt lightDistanceCache[2 * DCOLS - 1][2 * DROWS - 1];
+static boolean lightDistanceCacheReady = false;
+
+void markLightingMapDirty(void) {
+    glowCacheDirty = true;
+}
+
+static void rebuildGlowCache(void) {
+    short i, j;
+    enum dungeonLayers layer;
+    enum tileType tile;
+
+    glowCacheCount = 0;
+    for (i = 0; i < DCOLS; i++) {
+        for (j = 0; j < DROWS; j++) {
+            for (layer = 0; layer < NUMBER_TERRAIN_LAYERS; layer++) {
+                tile = pmap[i][j].layers[layer];
+                if (tileCatalog[tile].glowLight) {
+                    glowCache[glowCacheCount].x = i;
+                    glowCache[glowCacheCount].y = j;
+                    glowCache[glowCacheCount].layer = layer;
+                    glowCacheCount++;
+                }
+            }
+        }
+    }
+    glowCacheDirty = false;
+}
+
+static void ensureLightDistanceCache(void) {
+    short dx, dy;
+
+    if (lightDistanceCacheReady) {
+        return;
+    }
+
+    for (dx = -(DCOLS - 1); dx <= DCOLS - 1; dx++) {
+        for (dy = -(DROWS - 1); dy <= DROWS - 1; dy++) {
+            lightDistanceCache[dx + DCOLS - 1][dy + DROWS - 1] =
+                fp_sqrt(((fixpt) dx * dx + (fixpt) dy * dy) * FP_FACTOR);
+        }
+    }
+
+    lightDistanceCacheReady = true;
+}
+
+static inline fixpt lightDistance(short dx, short dy) {
+    return lightDistanceCache[dx + DCOLS - 1][dy + DROWS - 1];
+}
 
 void logLights() {
     short i, j;
@@ -60,6 +120,7 @@ boolean paintLight(const lightSource *theLight, short x, short y, boolean isMine
     boolean dispelShadows, overlappedFieldOfView;
 
     brogueAssert(rogue.RNG == RNG_SUBSTANTIVE);
+    ensureLightDistanceCache();
 
     radius = randClump(theLight->lightRadius) * FP_FACTOR / 100;
     radiusRounded = fp_round(radius);
@@ -90,7 +151,7 @@ boolean paintLight(const lightSource *theLight, short x, short y, boolean isMine
     for (i = max(0, x - radiusRounded); i < DCOLS && i < x + radiusRounded; i++) {
         for (j = max(0, y - radiusRounded); j < DROWS && j < y + radiusRounded; j++) {
             if (grid[i][j]) {
-                lightMultiplier =   100 - (100 - fadeToPercent) * fp_sqrt(((i-x) * (i-x) + (j-y) * (j-y)) * FP_FACTOR) / radius;
+                lightMultiplier = 100 - (100 - fadeToPercent) * lightDistance(i - x, j - y) / radius;
                 for (k=0; k<3; k++) {
                     tmap[i][j].light[k] += colorComponents[k] * lightMultiplier / 100;;
                 }
@@ -113,6 +174,49 @@ boolean paintLight(const lightSource *theLight, short x, short y, boolean isMine
     }
 
     return overlappedFieldOfView;
+}
+
+static void paintMinersLightFromCurrentFOV(const lightSource *theLight, short x, short y) {
+    short i, j, k;
+    short colorComponents[3], randComponent, lightMultiplier;
+    short fadeToPercent, radiusRounded;
+    fixpt radius, distance;
+
+    brogueAssert(rogue.RNG == RNG_SUBSTANTIVE);
+    ensureLightDistanceCache();
+
+    radius = randClump(theLight->lightRadius) * FP_FACTOR / 100;
+    if (radius <= 0) {
+        radius = FP_FACTOR;
+    }
+    radiusRounded = fp_round(radius);
+
+    randComponent = rand_range(0, theLight->lightColor->rand);
+    colorComponents[0] = randComponent + theLight->lightColor->red + rand_range(0, theLight->lightColor->redRand);
+    colorComponents[1] = randComponent + theLight->lightColor->green + rand_range(0, theLight->lightColor->greenRand);
+    colorComponents[2] = randComponent + theLight->lightColor->blue + rand_range(0, theLight->lightColor->blueRand);
+
+    fadeToPercent = theLight->radialFadeToPercent;
+
+    for (i = max(0, x - radiusRounded); i < DCOLS && i < x + radiusRounded; i++) {
+        for (j = max(0, y - radiusRounded); j < DROWS && j < y + radiusRounded; j++) {
+            if (!(pmap[i][j].flags & IN_FIELD_OF_VIEW)) {
+                continue;
+            }
+            distance = lightDistance(i - x, j - y);
+            if (distance > radius) {
+                continue;
+            }
+            lightMultiplier = 100 - (100 - fadeToPercent) * distance / radius;
+            for (k = 0; k < 3; k++) {
+                tmap[i][j].light[k] += colorComponents[k] * lightMultiplier / 100;
+            }
+        }
+    }
+
+    tmap[x][y].light[0] += colorComponents[0];
+    tmap[x][y].light[1] += colorComponents[1];
+    tmap[x][y].light[2] += colorComponents[2];
 }
 
 
@@ -207,11 +311,15 @@ static void recordOldLights() {
 
 void updateLighting() {
     short i, j, k;
-    enum dungeonLayers layer;
+    int glowIndex;
     enum tileType tile;
+    boolean compactBridgeMode = !brh_bridge_should_refresh_dungeon_cell();
 
     // Copy Light over oldLight
-    recordOldLights();
+    BRH_PROFILE_START(_brh_profile_lighting_reset, BRH_ZONE_LIGHTING_RESET);
+    if (!compactBridgeMode) {
+        recordOldLights();
+    }
 
     // and then zero out Light.
     for (i = 0; i < DCOLS; i++) {
@@ -222,20 +330,33 @@ void updateLighting() {
             pmap[i][j].flags |= IS_IN_SHADOW;
         }
     }
+    BRH_PROFILE_END(BRH_ZONE_LIGHTING_RESET, _brh_profile_lighting_reset);
 
     // Paint all glowing tiles.
-    for (i = 0; i < DCOLS; i++) {
-        for (j = 0; j < DROWS; j++) {
-            for (layer = 0; layer < NUMBER_TERRAIN_LAYERS; layer++) {
-                tile = pmap[i][j].layers[layer];
-                if (tileCatalog[tile].glowLight) {
-                    paintLight(&(lightCatalog[tileCatalog[tile].glowLight]), i, j, false, false);
-                }
-            }
+    BRH_PROFILE_START(_brh_profile_lighting_tile_glow, BRH_ZONE_LIGHTING_TILE_GLOW);
+    if (glowCacheDirty) {
+        rebuildGlowCache();
+    }
+    if (compactBridgeMode) {
+        BRH_PROFILE_END(BRH_ZONE_LIGHTING_TILE_GLOW, _brh_profile_lighting_tile_glow);
+        goto paint_creature_lights;
+    }
+    for (glowIndex = 0; glowIndex < glowCacheCount; glowIndex++) {
+        i = glowCache[glowIndex].x;
+        j = glowCache[glowIndex].y;
+        tile = pmap[i][j].layers[glowCache[glowIndex].layer];
+        enum lightType lightType = tileCatalog[tile].glowLight;
+        if (lightType) {
+            paintLight(&(lightCatalog[lightType]), i, j, false, false);
+        } else {
+            glowCacheDirty = true;
         }
     }
+    BRH_PROFILE_END(BRH_ZONE_LIGHTING_TILE_GLOW, _brh_profile_lighting_tile_glow);
 
     // Cycle through monsters and paint their lights:
+paint_creature_lights:
+    BRH_PROFILE_START(_brh_profile_lighting_creatures, BRH_ZONE_LIGHTING_CREATURES);
     boolean handledPlayer = false;
     for (creatureIterator it = iterateCreatures(monsters); !handledPlayer || hasNextCreature(it);) {
         creature *monst = !handledPlayer ? &player : nextCreature(&it);
@@ -263,11 +384,21 @@ void updateLighting() {
             paintLight(&lightCatalog[TELEPATHY_LIGHT], monst->loc.x, monst->loc.y, false, true);
         }
     }
+    BRH_PROFILE_END(BRH_ZONE_LIGHTING_CREATURES, _brh_profile_lighting_creatures);
 
-    updateDisplayDetail();
+    BRH_PROFILE_START(_brh_profile_lighting_display_detail, BRH_ZONE_LIGHTING_DISPLAY_DETAIL);
+    if (!compactBridgeMode) {
+        updateDisplayDetail();
+    }
+    BRH_PROFILE_END(BRH_ZONE_LIGHTING_DISPLAY_DETAIL, _brh_profile_lighting_display_detail);
 
     // Miner's light:
-    paintLight(&rogue.minersLight, player.loc.x, player.loc.y, true, true);
+    BRH_PROFILE_START(_brh_profile_lighting_miner, BRH_ZONE_LIGHTING_MINER);
+    if (compactBridgeMode && rogue.minersLight.passThroughCreatures) {
+        paintMinersLightFromCurrentFOV(&rogue.minersLight, player.loc.x, player.loc.y);
+    } else {
+        paintLight(&rogue.minersLight, player.loc.x, player.loc.y, true, true);
+    }
 
     if (player.status[STATUS_INVISIBLE]) {
         player.info.foreColor = &playerInvisibleColor;
@@ -278,6 +409,7 @@ void updateLighting() {
     } else {
         player.info.foreColor = &playerInLightColor;
     }
+    BRH_PROFILE_END(BRH_ZONE_LIGHTING_MINER, _brh_profile_lighting_miner);
 }
 
 boolean playerInDarkness() {

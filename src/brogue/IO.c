@@ -27,6 +27,7 @@
 #include "Rogue.h"
 #include "GlobalsBase.h"
 #include "Globals.h"
+#include "bridge-profile.h"
 
 #ifdef BROGUE_BRIDGE
 extern void brh_mark_invalid_key(void);
@@ -577,6 +578,22 @@ void mainInputLoop() {
     rogue.cursorLoc = INVALID_POS;
 
     while (!rogue.gameHasEnded && (!playingBack || !canceled)) { // repeats until the game ends
+        BRH_PROFILE_START(_brh_profile_input_loop_prep, BRH_ZONE_INPUT_LOOP_PREP);
+
+#ifdef BROGUE_BRIDGE
+        if (serverMode && !playingBack && !rogue.cursorMode) {
+            BRH_PROFILE_END(BRH_ZONE_INPUT_LOOP_PREP, _brh_profile_input_loop_prep);
+            nextBrogueEvent(&theEvent, false, false, false);
+            executeEvent(&theEvent);
+            if (rogue.playbackMode) {
+                playingBack = true;
+                rogue.playbackMode = false;
+                confirmMessages();
+                break;
+            }
+            continue;
+        }
+#endif
 
         oldRNG = rogue.RNG;
         rogue.RNG = RNG_COSMETIC;
@@ -702,6 +719,7 @@ void mainInputLoop() {
 
             // Get the input!
             rogue.playbackMode = playingBack;
+            BRH_PROFILE_END(BRH_ZONE_INPUT_LOOP_PREP, _brh_profile_input_loop_prep);
             doEvent = moveCursor(&targetConfirmed, &canceled, &tabKey, &rogue.cursorLoc, &theEvent, &state, !textDisplayed, rogue.cursorMode, true);
             rogue.playbackMode = false;
 
@@ -862,6 +880,11 @@ static screenDisplayBuffer previouslyPlottedCells;
 // Only cells which have changed since the previous commitDraws are actually
 // drawn.
 void commitDraws() {
+    BRH_PROFILE_START(_brh_profile_commit_draws, BRH_ZONE_COMMIT_DRAWS);
+    if (serverMode) {
+        BRH_PROFILE_END(BRH_ZONE_COMMIT_DRAWS, _brh_profile_commit_draws);
+        return;
+    }
     for (int j = 0; j < ROWS; j++) {
         for (int i = 0; i < COLS; i++) {
             cellDisplayBuffer *lastPlotted = &previouslyPlottedCells.cells[i][j];
@@ -890,11 +913,17 @@ void commitDraws() {
             *lastPlotted = *curr;
         }
     }
+    BRH_PROFILE_END(BRH_ZONE_COMMIT_DRAWS, _brh_profile_commit_draws);
 }
 
 // flags the entire window as needing to be redrawn at next flush.
 // very low level -- does not interface with the guts of the game.
 void refreshScreen() {
+    BRH_PROFILE_START(_brh_profile_refresh_screen, BRH_ZONE_REFRESH_SCREEN);
+    if (serverMode) {
+        BRH_PROFILE_END(BRH_ZONE_REFRESH_SCREEN, _brh_profile_refresh_screen);
+        return;
+    }
     for (int i = 0; i < COLS; i++) {
         for (int j = 0; j < ROWS; j++) {
             cellDisplayBuffer *curr = &displayBuffer.cells[i][j];
@@ -911,17 +940,20 @@ void refreshScreen() {
             previouslyPlottedCells.cells[i][j] = *curr;
         }
     }
+    BRH_PROFILE_END(BRH_ZONE_REFRESH_SCREEN, _brh_profile_refresh_screen);
 }
 
 // higher-level redraw
 void displayLevel() {
     short i, j;
+    BRH_PROFILE_START(_brh_profile_display_level, BRH_ZONE_DISPLAY_LEVEL);
 
     for( i=0; i<DCOLS; i++ ) {
         for (j = DROWS-1; j >= 0; j--) {
             refreshDungeonCell((pos){ i, j });
         }
     }
+    BRH_PROFILE_END(BRH_ZONE_DISPLAY_LEVEL, _brh_profile_display_level);
 }
 
 // converts colors into components
@@ -1511,10 +1543,17 @@ void getCellAppearance(pos loc, enum displayGlyph *returnChar, color *returnFore
 void refreshDungeonCell(pos loc) {
     enum displayGlyph cellChar;
     color foreColor, backColor;
+    BRH_PROFILE_START(_brh_profile_refresh_dungeon_cell, BRH_ZONE_REFRESH_DUNGEON_CELL);
     brogueAssert(isPosInMap(loc));
+    if (!brh_bridge_should_refresh_dungeon_cell()) {
+        brh_bridge_update_compact_cell(loc.x, loc.y);
+        BRH_PROFILE_END(BRH_ZONE_REFRESH_DUNGEON_CELL, _brh_profile_refresh_dungeon_cell);
+        return;
+    }
 
     getCellAppearance(loc, &cellChar, &foreColor, &backColor);
     plotCharWithColor(cellChar, mapToWindow(loc), &foreColor, &backColor);
+    BRH_PROFILE_END(BRH_ZONE_REFRESH_DUNGEON_CELL, _brh_profile_refresh_dungeon_cell);
 }
 
 void applyColorMultiplier(color *baseColor, const color *multiplierColor) {
@@ -1765,6 +1804,10 @@ void plotCharWithColor(enum displayGlyph inputChar, windowpos loc, const color *
 
     brogueAssert(locIsInWindow(loc));
     if (!locIsInWindow(loc)) {
+        return;
+    }
+
+    if (!brh_bridge_should_refresh_dungeon_cell()) {
         return;
     }
 
@@ -2372,6 +2415,9 @@ static void exploreKey(const boolean controlKey) {
 }
 
 boolean pauseBrogue(short milliseconds, PauseBehavior behavior) {
+    if (!brh_bridge_should_refresh_dungeon_cell()) {
+        return (rogue.playbackMode && rogue.playbackFastForward);
+    }
     commitDraws();
     if (rogue.playbackMode && rogue.playbackFastForward) {
         return true;
@@ -2457,6 +2503,7 @@ void executeMouseClick(rogueEvent *theEvent) {
 
 void executeKeystroke(signed long keystroke, boolean controlKey, boolean shiftKey) {
     short direction = -1;
+    BRH_PROFILE_START(_brh_profile_execute_keystroke, BRH_ZONE_EXECUTE_KEYSTROKE);
 
     confirmMessages();
     stripShiftFromMovementKeystroke(&keystroke);
@@ -2630,6 +2677,7 @@ void executeKeystroke(signed long keystroke, boolean controlKey, boolean shiftKe
             break;
         case SAVE_GAME_KEY:
             if (rogue.playbackMode || serverMode) {
+                BRH_PROFILE_END(BRH_ZONE_EXECUTE_KEYSTROKE, _brh_profile_execute_keystroke);
                 return;
             }
             if (confirm("Save this game and exit?", false)) {
@@ -2707,11 +2755,13 @@ void executeKeystroke(signed long keystroke, boolean controlKey, boolean shiftKe
     if (direction >= 0) { // if it was a movement command
         hideCursor();
         considerCautiousMode();
+        BRH_PROFILE_START(_brh_profile_direction_action, BRH_ZONE_DIRECTION_ACTION);
         if (controlKey || shiftKey) {
             playerRuns(direction);
         } else {
             playerMoves(direction);
         }
+        BRH_PROFILE_END(BRH_ZONE_DIRECTION_ACTION, _brh_profile_direction_action);
         refreshSideBar(-1, -1, false);
     }
 
@@ -2723,6 +2773,7 @@ void executeKeystroke(signed long keystroke, boolean controlKey, boolean shiftKe
     }
 
     rogue.cautiousMode = false;
+    BRH_PROFILE_END(BRH_ZONE_EXECUTE_KEYSTROKE, _brh_profile_execute_keystroke);
 }
 
 boolean getInputTextString(char *inputText,
@@ -3719,6 +3770,11 @@ void refreshSideBar(short focusX, short focusY, boolean focusedEntityMustGoFirst
     if (rogue.gameHasEnded || rogue.playbackFastForward) {
         return;
     }
+    BRH_PROFILE_START(_brh_profile_refresh_sidebar, BRH_ZONE_REFRESH_SIDEBAR);
+    if (!brh_bridge_should_refresh_sidebar()) {
+        BRH_PROFILE_END(BRH_ZONE_REFRESH_SIDEBAR, _brh_profile_refresh_sidebar);
+        return;
+    }
 
     oldRNG = rogue.RNG;
     rogue.RNG = RNG_COSMETIC;
@@ -3921,6 +3977,7 @@ void refreshSideBar(short focusX, short focusY, boolean focusedEntityMustGoFirst
     }
 
     restoreRNG;
+    BRH_PROFILE_END(BRH_ZONE_REFRESH_SIDEBAR, _brh_profile_refresh_sidebar);
 }
 
 void printString(const char *theString, short x, short y, const color *foreColor, const color *backColor, screenDisplayBuffer *dbuf) {

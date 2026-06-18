@@ -1157,6 +1157,7 @@ boolean playerMoves(short direction) {
                 }
                 if (tileCatalog[pmap[x][y].layers[SURFACE]].flags & T_ENTANGLES) {
                     pmap[x][y].layers[SURFACE] = NOTHING;
+                    markEnvironmentTerrainCacheDirty();
                 }
             }
         }
@@ -2116,6 +2117,7 @@ void discover(short x, short y) {
             if (tileCatalog[pmap[x][y].layers[layer]].mechFlags & TM_IS_SECRET) {
                 feat = &dungeonFeatureCatalog[tileCatalog[pmap[x][y].layers[layer]].discoverType];
                 pmap[x][y].layers[layer] = (layer == DUNGEON ? FLOOR : NOTHING);
+                markEnvironmentTerrainCacheDirty();
                 spawnDungeonFeature(x, y, feat, true, false);
             }
         }
@@ -2331,6 +2333,123 @@ void updateFieldOfViewDisplay(boolean updateDancingTerrain, boolean refreshDispl
                                   }
         }
     }
+    restoreRNG;
+}
+
+void updateFieldOfViewDisplayCompact(const pos *fovCells, short fovCellCount,
+                                     const pos *wasVisibleCells, short wasVisibleCellCount,
+                                     boolean refreshDisplay) {
+    short index, i, j;
+    item *theItem;
+    char buf[COLS*3], name[COLS*3];
+
+    assureCosmeticRNG;
+
+    for (index=0; index<fovCellCount; index++) {
+        i = fovCells[index].x;
+        j = fovCells[index].y;
+        if ((pmap[i][j].flags & IN_FIELD_OF_VIEW)
+            && (max(0, tmap[i][j].light[0])
+                + max(0, tmap[i][j].light[1])
+                + max(0, tmap[i][j].light[2]) > VISIBILITY_THRESHOLD)
+            && !(pmap[i][j].flags & CLAIRVOYANT_DARKENED)) {
+
+            pmap[i][j].flags |= VISIBLE;
+        }
+
+        if ((pmap[i][j].flags & VISIBLE) && !(pmap[i][j].flags & WAS_VISIBLE)) {
+            if (!(pmap[i][j].flags & DISCOVERED) && rogue.automationActive) {
+                if (pmap[i][j].flags & HAS_ITEM) {
+                    theItem = itemAtLoc((pos){ i, j });
+                    if (theItem && (theItem->category & KEY)) {
+                        itemName(theItem, name, false, true, NULL);
+                        sprintf(buf, "you see %s.", name);
+                        messageWithColor(buf, &itemMessageColor, 0);
+                    }
+                }
+                if (!(pmap[i][j].flags & MAGIC_MAPPED)
+                    && cellHasTMFlag((pos){ i, j }, TM_INTERRUPT_EXPLORATION_WHEN_SEEN)) {
+
+                    strcpy(name, tileCatalog[pmap[i][j].layers[layerWithTMFlag(i, j, TM_INTERRUPT_EXPLORATION_WHEN_SEEN)]].description);
+                    sprintf(buf, "you see %s.", name);
+                    messageWithColor(buf, &backgroundMessageColor, 0);
+                }
+            }
+            discoverCell(i, j);
+            if (refreshDisplay) {
+                refreshDungeonCell((pos){ i, j });
+            }
+        }
+    }
+
+    for (index=0; index<wasVisibleCellCount; index++) {
+        i = wasVisibleCells[index].x;
+        j = wasVisibleCells[index].y;
+        if (!(pmap[i][j].flags & VISIBLE) && (pmap[i][j].flags & WAS_VISIBLE)) {
+            storeMemories(i, j);
+            if (refreshDisplay) {
+                refreshDungeonCell((pos){ i, j });
+            }
+        }
+    }
+
+    restoreRNG;
+}
+
+void updateFieldOfViewDisplayCompactUnlit(const pos *fovCells, short fovCellCount,
+                                          const pos *wasVisibleCells, short wasVisibleCellCount,
+                                          boolean refreshDisplay) {
+    short index, i, j;
+    item *theItem;
+    char buf[COLS*3], name[COLS*3];
+
+    assureCosmeticRNG;
+
+    for (index=0; index<fovCellCount; index++) {
+        i = fovCells[index].x;
+        j = fovCells[index].y;
+        if ((pmap[i][j].flags & IN_FIELD_OF_VIEW)
+            && !(pmap[i][j].flags & CLAIRVOYANT_DARKENED)) {
+
+            pmap[i][j].flags |= VISIBLE;
+        }
+
+        if ((pmap[i][j].flags & VISIBLE) && !(pmap[i][j].flags & WAS_VISIBLE)) {
+            if (!(pmap[i][j].flags & DISCOVERED) && rogue.automationActive) {
+                if (pmap[i][j].flags & HAS_ITEM) {
+                    theItem = itemAtLoc((pos){ i, j });
+                    if (theItem && (theItem->category & KEY)) {
+                        itemName(theItem, name, false, true, NULL);
+                        sprintf(buf, "you see %s.", name);
+                        messageWithColor(buf, &itemMessageColor, 0);
+                    }
+                }
+                if (!(pmap[i][j].flags & MAGIC_MAPPED)
+                    && cellHasTMFlag((pos){ i, j }, TM_INTERRUPT_EXPLORATION_WHEN_SEEN)) {
+
+                    strcpy(name, tileCatalog[pmap[i][j].layers[layerWithTMFlag(i, j, TM_INTERRUPT_EXPLORATION_WHEN_SEEN)]].description);
+                    sprintf(buf, "you see %s.", name);
+                    messageWithColor(buf, &backgroundMessageColor, 0);
+                }
+            }
+            discoverCell(i, j);
+            if (refreshDisplay) {
+                refreshDungeonCell((pos){ i, j });
+            }
+        }
+    }
+
+    for (index=0; index<wasVisibleCellCount; index++) {
+        i = wasVisibleCells[index].x;
+        j = wasVisibleCells[index].y;
+        if (!(pmap[i][j].flags & VISIBLE) && (pmap[i][j].flags & WAS_VISIBLE)) {
+            storeMemories(i, j);
+            if (refreshDisplay) {
+                refreshDungeonCell((pos){ i, j });
+            }
+        }
+    }
+
     restoreRNG;
 }
 

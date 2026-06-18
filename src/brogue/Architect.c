@@ -3068,6 +3068,7 @@ void setUpWaypoints() {
 //        displayGrid(rogue.wpDistance[i]);
 //        temporaryMessage("Waypoint distance map:", REQUIRE_ACKNOWLEDGMENT);
     }
+    markWaypointRefreshComplete();
 }
 
 void zeroOutGrid(char grid[DCOLS][DROWS]) {
@@ -3234,7 +3235,7 @@ boolean fillSpawnMap(enum dungeonLayers layer,
 
                 if ((tileCatalog[surfaceTileType].flags & T_IS_FIRE)
                     && !(tileCatalog[pmap[i][j].layers[layer]].flags & T_IS_FIRE)) {
-                    pmap[i][j].flags |= CAUGHT_FIRE_THIS_TURN;
+                    markCaughtFireThisTurn(i, j);
                 }
 
                 if ((tileCatalog[pmap[i][j].layers[layer]].flags & T_PATHING_BLOCKER)
@@ -3244,6 +3245,7 @@ boolean fillSpawnMap(enum dungeonLayers layer,
                 }
 
                 pmap[i][j].layers[layer] = surfaceTileType; // Place the terrain!
+                markEnvironmentTerrainCacheDirty();
                 accomplishedSomething = true;
 
                 if (refresh) {
@@ -3384,6 +3386,7 @@ boolean spawnDungeonFeature(short x, short y, dungeonFeature *feat, boolean refr
         if (feat->layer == GAS) {
             pmap[x][y].volume += feat->startProbability;
             pmap[x][y].layers[GAS] = feat->tile;
+            markEnvironmentTerrainCacheDirty();
             if (refreshCell) {
                 refreshDungeonCell((pos){ x, y });
             }
@@ -3432,6 +3435,7 @@ boolean spawnDungeonFeature(short x, short y, dungeonFeature *feat, boolean refr
                                 }
                             }
                             pmap[i][j].layers[layer] = (layer == DUNGEON ? FLOOR : NOTHING);
+                            markEnvironmentTerrainCacheDirty();
                         }
                     }
                 }
@@ -3440,6 +3444,12 @@ boolean spawnDungeonFeature(short x, short y, dungeonFeature *feat, boolean refr
     }
 
     if (succeeded) {
+        if (feat->tile || (feat->flags & (DFF_CLEAR_LOWER_PRIORITY_TERRAIN | DFF_CLEAR_OTHER_TERRAIN))) {
+            markLightingMapDirty();
+        }
+        if (feat->tile && feat->layer == GAS) {
+            markVolumetricGasMapDirty();
+        }
         if ((feat->flags & DFF_AGGRAVATES_MONSTERS) && feat->effectRadius) {
             aggravateMonsters(feat->effectRadius, x, y, &gray);
         }
@@ -3722,6 +3732,7 @@ boolean placeStairs(pos *upStairsLoc) {
     }
     pmapAt(downLoc)->layers[LIQUID]     = NOTHING;
     pmapAt(downLoc)->layers[SURFACE]    = NOTHING;
+    markEnvironmentTerrainCacheDirty();
 
     if (!levels[n+1].visited) {
         levels[n+1].upStairsLoc = downLoc;
@@ -3750,6 +3761,7 @@ boolean placeStairs(pos *upStairsLoc) {
     }
     pmapAt(upLoc)->layers[LIQUID] = NOTHING;
     pmapAt(upLoc)->layers[SURFACE] = NOTHING;
+    markEnvironmentTerrainCacheDirty();
 
     rogue.downLoc = downLoc;
     pmapAt(downLoc)->flags |= HAS_STAIRS;
@@ -3813,6 +3825,9 @@ void initializeLevel(pos upStairsLoc) {
     }
     freeGrid(mapToStairs);
     freeGrid(mapToPit);
+    markLightingMapDirty();
+    markVolumetricGasMapDirty();
+    markEnvironmentTerrainCacheDirty();
 }
 
 // fills (*x, *y) with the coordinates of a random cell with

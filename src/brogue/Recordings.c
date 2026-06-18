@@ -41,6 +41,10 @@ enum recordingSeekModes {
 };
 
 static void recordChar(unsigned char c) {
+    if (serverMode || !rogue.recording) {
+        return;
+    }
+
     if (locationInRecordingBuffer < INPUT_RECORD_BUFFER_MAX_SIZE) {
         inputRecordBuffer[locationInRecordingBuffer++] = c;
         recordingLocation++;
@@ -100,7 +104,7 @@ static void recordNumber(unsigned long number, short numberOfBytes) {
 void recordEvent(rogueEvent *event) {
     unsigned char c;
 
-    if (rogue.playbackMode) {
+    if (serverMode || !rogue.recording || rogue.playbackMode) {
         return;
     }
 
@@ -133,7 +137,7 @@ void recordEvent(rogueEvent *event) {
 void recordKeystroke(int keystroke, boolean controlKey, boolean shiftKey) {
     rogueEvent theEvent;
 
-    if (rogue.playbackMode) {
+    if (serverMode || !rogue.recording || rogue.playbackMode) {
         return;
     }
 
@@ -145,6 +149,10 @@ void recordKeystroke(int keystroke, boolean controlKey, boolean shiftKey) {
 }
 
 void cancelKeystroke() {
+    if (serverMode || !rogue.recording) {
+        return;
+    }
+
     brogueAssert(locationInRecordingBuffer >= 3);
     locationInRecordingBuffer -= 3; // a keystroke is encoded into 3 bytes
     recordingLocation -= 3;
@@ -162,7 +170,7 @@ void recordKeystrokeSequence(unsigned char *keystrokeSequence) {
 void recordMouseClick(short x, short y, boolean controlKey, boolean shiftKey) {
     rogueEvent theEvent;
 
-    if (rogue.playbackMode) {
+    if (serverMode || !rogue.recording || rogue.playbackMode) {
         return;
     }
 
@@ -463,6 +471,16 @@ static boolean getPatchVersion(char *versionString, unsigned short *patchVersion
 // creates a game recording file, or if in playback mode,
 // initializes based on and starts reading from the recording file
 void initRecording() {
+    if (serverMode) {
+        locationInRecordingBuffer = 0;
+        recordingLocation = 0;
+        rogue.recording = false;
+        rogue.playbackMode = false;
+        rogue.playbackOOS = false;
+        rogue.currentTurnNumber = 0;
+        return;
+    }
+
     if (currentFilePath[0] == '\0') {
         return;
     }

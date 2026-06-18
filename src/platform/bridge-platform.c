@@ -1,15 +1,24 @@
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <pthread.h>
+#include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <ucontext.h>
 
 #include "platform.h"
 #include "bridge-env.h"
+#include "bridge-profile.h"
 #include "GlobalsBase.h"
+#include "Globals.h"
 
-#define BRH_ABI_VERSION 9
+#define BRH_ABI_VERSION 11
 #define BRH_OBS_CELLS (COLS * ROWS)
 #define BRH_MAP_CELLS (DCOLS * DROWS)
 #define BRH_MAP_LAYER_CELLS (DCOLS * DROWS * NUMBER_TERRAIN_LAYERS)
@@ -24,6 +33,9 @@
 #define BRH_THREAD_STACK_SIZE (16 * 1024 * 1024)
 #define BRH_STEP_OK 0
 #define BRH_STEP_INVALID_KEY 1
+#define BRH_CAPTURE_NONE 0
+#define BRH_CAPTURE_FULL 1
+#define BRH_CAPTURE_COMPACT 2
 #define BRH_UNKNOWN_SHORT INT16_MIN
 #define BRH_OBS_CELL_FLAGS (DISCOVERED | VISIBLE | HAS_PLAYER | HAS_MONSTER | HAS_ITEM \
                             | IN_FIELD_OF_VIEW | WAS_VISIBLE | HAS_STAIRS | MAGIC_MAPPED \
@@ -83,10 +95,13 @@ struct brh_env {
 };
 
 int brh_reset(uint64_t seed, brh_observation *out);
+int brh_reset_compact(uint64_t seed, brh_compact_observation *out);
 int brh_step(long key, int control, int shift, brh_observation *out);
+int brh_step_compact(long key, int control, int shift, brh_compact_observation *out);
 int brh_step_no_observation(long key, int control, int shift);
 uint32_t brh_abi_version(void);
 size_t brh_observation_size(void);
+size_t brh_compact_observation_size(void);
 int brh_screen_cols(void);
 int brh_screen_rows(void);
 int brh_map_cols(void);
@@ -112,9 +127,9 @@ boolean nonInteractivePlayback = false;
 boolean hasGraphics = false;
 enum graphicsModes graphicsMode = TEXT_GRAPHICS;
 
-static pthread_mutex_t bridgeMutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t bridgeCond = PTHREAD_COND_INITIALIZER;
-static pthread_t bridgeThread;
+static ucontext_t bridgeCallerContext;
+static ucontext_t bridgeGameContext;
+static void *bridgeGameStack = NULL;
 static boolean bridgeThreadStarted = false;
 static boolean bridgeWaitingForAction = false;
 static boolean bridgeActionReady = false;
@@ -124,16 +139,23 @@ static boolean bridgeActiveControl = false;
 static boolean bridgeActiveShift = false;
 static int bridgeExitCode = 0;
 static int bridgeLastStepStatus = BRH_STEP_OK;
-static boolean bridgeCaptureObservation = true;
+static int bridgeCaptureMode = BRH_CAPTURE_FULL;
 static char bridgeLastError[256] = "";
 static rogueEvent bridgePendingEvent = {0};
 static brh_observation bridgeLastObservation = {0};
+static brh_compact_observation bridgeLastCompactObservation = {0};
+static uint8_t bridgeCompactMapChars[BRH_PUBLIC_COMPACT_CELLS] = {0};
+static boolean bridgeCompactMapDirty = true;
 static int64_t bridgeEndScore = 0;
 static boolean bridgeEndWon = false;
+static brh_profile bridgeProfile = {0};
 static pthread_mutex_t bridgeEnvMutex = PTHREAD_MUTEX_INITIALIZER;
 static brh_env *bridgeActiveEnv = NULL;
+int brh_profile_enabled_cache = -1;
 
-static void *bridge_thread_main(void *unused);
+static int bridge_profile_enabled(void);
+static uint64_t bridge_now_ns(void);
+static void bridge_coroutine_main(void);
 static void bridge_gameLoop(void);
 static boolean bridge_pauseForMilliseconds(short milliseconds, PauseBehavior behavior);
 static void bridge_nextKeyOrMouseEvent(rogueEvent *returnEvent,
@@ -157,23 +179,33 @@ static void bridge_notifyEvent(short eventId,
                                const char *str2);
 static enum graphicsModes bridge_setGraphicsMode(enum graphicsModes mode);
 static void bridge_fill_observation(brh_observation *out);
+static void bridge_fill_compact_observation(brh_compact_observation *out);
 static void bridge_fill_unknown_semantics(brh_observation *out);
 static void bridge_fill_program_state(brh_observation *out);
+static void bridge_fill_compact_program_state(brh_compact_observation *out);
 static void bridge_fill_map_semantics(brh_observation *out);
 static void bridge_fill_item_semantics(brh_observation *out);
 static void bridge_fill_monster_semantics(brh_observation *out);
 static void bridge_fill_inventory_semantics(brh_observation *out);
 static void bridge_set_error(const char *message);
 static void bridge_set_error_locked(const char *message);
+static int bridge_reset_internal(uint64_t seed,
+                                 brh_observation *out,
+                                 brh_compact_observation *compactOut,
+                                 int captureMode);
 static int bridge_step_internal(long key,
                                 int control,
                                 int shift,
                                 brh_observation *out,
-                                boolean captureObservation);
+                                brh_compact_observation *compactOut,
+                                int captureMode);
+static int bridge_start_coroutine_locked(void);
+static int bridge_resume_coroutine_locked(void);
+static void bridge_finish_coroutine_locked(int exitCode);
 static int bridge_env_validate_active(brh_env *env);
 static void bridge_env_update_outputs(brh_env *env);
 static void bridge_env_update_outputs_from_observation(brh_env *env, const brh_observation *observation);
-static int bridge_wait_for_observation_locked(boolean allowExit);
+static int bridge_check_observation_ready_locked(boolean allowExit);
 static void bridge_copy_observation(brh_observation *to, const brh_observation *from);
 static void bridge_initialize_launch_state(uint64_t seed);
 static int bridge_append_message_line(brh_observation *out, int offset, const char *line);
@@ -181,6 +213,10 @@ static int bridge_copy_plain_text(uint8_t *target, int targetLength, const char 
 static int bridge_map_index(short x, short y);
 static boolean bridge_loc_is_in_map(pos loc);
 static int bridge_inventory_slot(const brh_observation *out, char letter);
+static void bridge_compact_rebuild_map_chars(void);
+static void bridge_compact_update_map_cell(short x, short y);
+static enum displayGlyph bridge_compact_cell_glyph(short x, short y);
+static enum displayGlyph bridge_compact_terrain_glyph(short x, short y);
 static int16_t bridge_observed_item_kind(const item *theItem);
 static int16_t bridge_observed_remembered_item_kind(uint16_t category, short kind);
 static int16_t bridge_observed_enchant(const item *theItem, short enchant);
@@ -205,17 +241,37 @@ static struct brogueConsole bridgeConsole = {
 };
 
 int brh_reset(uint64_t seed, brh_observation *out) {
-    int rc;
-    pthread_attr_t threadAttr;
+    return bridge_reset_internal(seed, out, NULL, BRH_CAPTURE_FULL);
+}
 
-    if (out == NULL) {
+int brh_reset_compact(uint64_t seed, brh_compact_observation *out) {
+    return bridge_reset_internal(seed, NULL, out, BRH_CAPTURE_COMPACT);
+}
+
+static int bridge_reset_internal(uint64_t seed,
+                                 brh_observation *out,
+                                 brh_compact_observation *compactOut,
+                                 int captureMode) {
+    int rc;
+    int prof;
+    uint64_t start = 0;
+
+    if (captureMode == BRH_CAPTURE_FULL && out == NULL) {
         bridge_set_error("observation pointer must not be null");
         return -1;
     }
+    if (captureMode == BRH_CAPTURE_COMPACT && compactOut == NULL) {
+        bridge_set_error("compact observation pointer must not be null");
+        return -1;
+    }
 
+    prof = bridge_profile_enabled();
+    if (prof) {
+        start = bridge_now_ns();
+        bridgeProfile.reset_calls++;
+    }
     brh_close();
 
-    pthread_mutex_lock(&bridgeMutex);
     bridgeLastError[0] = '\0';
     bridgeWaitingForAction = false;
     bridgeActionReady = false;
@@ -223,10 +279,13 @@ int brh_reset(uint64_t seed, brh_observation *out) {
     bridgeExited = false;
     bridgeExitCode = 0;
     bridgeLastStepStatus = BRH_STEP_OK;
-    bridgeCaptureObservation = true;
+    bridgeCaptureMode = captureMode;
     bridgeActiveControl = false;
     bridgeActiveShift = false;
     memset(&bridgeLastObservation, 0, sizeof(bridgeLastObservation));
+    memset(&bridgeLastCompactObservation, 0, sizeof(bridgeLastCompactObservation));
+    memset(bridgeCompactMapChars, ' ', sizeof(bridgeCompactMapChars));
+    bridgeCompactMapDirty = true;
     memset(&bridgePendingEvent, 0, sizeof(bridgePendingEvent));
     bridgeEndScore = 0;
     bridgeEndWon = false;
@@ -239,69 +298,73 @@ int brh_reset(uint64_t seed, brh_observation *out) {
     gameVariant = VARIANT_BROGUE;
     bridge_initialize_launch_state(seed);
 
-    rc = pthread_attr_init(&threadAttr);
+    rc = bridge_start_coroutine_locked();
     if (rc != 0) {
-        bridgeThreadStarted = false;
-        bridge_set_error_locked("failed to initialize Brogue bridge thread attributes");
-        pthread_mutex_unlock(&bridgeMutex);
-        return -1;
+        rc = -1;
+        goto done;
     }
-    rc = pthread_attr_setstacksize(&threadAttr, BRH_THREAD_STACK_SIZE);
-    if (rc != 0) {
-        pthread_attr_destroy(&threadAttr);
-        bridgeThreadStarted = false;
-        bridge_set_error_locked("failed to configure Brogue bridge thread stack");
-        pthread_mutex_unlock(&bridgeMutex);
-        return -1;
-    }
-    rc = pthread_create(&bridgeThread, &threadAttr, bridge_thread_main, NULL);
-    pthread_attr_destroy(&threadAttr);
-    if (rc != 0) {
-        bridgeThreadStarted = false;
-        bridge_set_error_locked("failed to start Brogue bridge thread");
-        pthread_mutex_unlock(&bridgeMutex);
-        return -1;
-    }
-    bridgeThreadStarted = true;
 
-    rc = bridge_wait_for_observation_locked(false);
+    rc = bridge_resume_coroutine_locked();
     if (rc == 0) {
-        bridge_copy_observation(out, &bridgeLastObservation);
+        rc = bridge_check_observation_ready_locked(false);
     }
-    pthread_mutex_unlock(&bridgeMutex);
+    if (rc == 0) {
+        if (captureMode == BRH_CAPTURE_FULL) {
+            bridge_copy_observation(out, &bridgeLastObservation);
+        } else if (captureMode == BRH_CAPTURE_COMPACT) {
+            memcpy(compactOut, &bridgeLastCompactObservation, sizeof(*compactOut));
+        }
+    }
+done:
+    if (prof) bridgeProfile.reset_ns += bridge_now_ns() - start;
     return rc;
 }
 
 int brh_step(long key, int control, int shift, brh_observation *out) {
-    return bridge_step_internal(key, control, shift, out, true);
+    return bridge_step_internal(key, control, shift, out, NULL, BRH_CAPTURE_FULL);
+}
+
+int brh_step_compact(long key, int control, int shift, brh_compact_observation *out) {
+    return bridge_step_internal(key, control, shift, NULL, out, BRH_CAPTURE_COMPACT);
 }
 
 int brh_step_no_observation(long key, int control, int shift) {
-    return bridge_step_internal(key, control, shift, NULL, false);
+    return bridge_step_internal(key, control, shift, NULL, NULL, BRH_CAPTURE_NONE);
 }
 
 static int bridge_step_internal(long key,
                                 int control,
                                 int shift,
                                 brh_observation *out,
-                                boolean captureObservation) {
+                                brh_compact_observation *compactOut,
+                                int captureMode) {
     int rc;
+    int prof;
+    uint64_t start = 0;
 
-    if (captureObservation && out == NULL) {
+    if (captureMode == BRH_CAPTURE_FULL && out == NULL) {
         bridge_set_error("observation pointer must not be null");
         return -1;
     }
+    if (captureMode == BRH_CAPTURE_COMPACT && compactOut == NULL) {
+        bridge_set_error("compact observation pointer must not be null");
+        return -1;
+    }
 
-    pthread_mutex_lock(&bridgeMutex);
+    prof = bridge_profile_enabled();
+    if (prof) {
+        start = bridge_now_ns();
+        bridgeProfile.step_calls++;
+    }
     if (!bridgeThreadStarted || bridgeExited) {
         bridge_set_error_locked("Brogue bridge is not running");
-        pthread_mutex_unlock(&bridgeMutex);
-        return -1;
+        rc = -1;
+        goto done;
     }
     if (!bridgeWaitingForAction) {
         bridge_set_error_locked("Brogue bridge is not waiting for an action");
-        pthread_mutex_unlock(&bridgeMutex);
-        return -1;
+        rc = -1;
+        goto done;
     }
 
     bridgePendingEvent.eventType = KEYSTROKE;
@@ -310,19 +373,27 @@ static int bridge_step_internal(long key,
     bridgePendingEvent.controlKey = control ? true : false;
     bridgePendingEvent.shiftKey = shift ? true : false;
     bridgeLastStepStatus = BRH_STEP_OK;
-    bridgeCaptureObservation = captureObservation;
+    if (captureMode == BRH_CAPTURE_COMPACT && bridgeCaptureMode != BRH_CAPTURE_COMPACT) {
+        bridgeCompactMapDirty = true;
+    }
+    bridgeCaptureMode = captureMode;
     bridgeActionReady = true;
     bridgeWaitingForAction = false;
-    pthread_cond_broadcast(&bridgeCond);
 
-    rc = bridge_wait_for_observation_locked(true);
+    rc = bridge_resume_coroutine_locked();
     if (rc == 0) {
-        if (captureObservation) {
+        rc = bridge_check_observation_ready_locked(true);
+    }
+    if (rc == 0) {
+        if (captureMode == BRH_CAPTURE_FULL) {
             bridge_copy_observation(out, &bridgeLastObservation);
+        } else if (captureMode == BRH_CAPTURE_COMPACT) {
+            memcpy(compactOut, &bridgeLastCompactObservation, sizeof(*compactOut));
         }
         rc = bridgeLastStepStatus;
     }
-    pthread_mutex_unlock(&bridgeMutex);
+done:
+    if (prof) bridgeProfile.step_ns += bridge_now_ns() - start;
     return rc;
 }
 
@@ -332,6 +403,24 @@ uint32_t brh_abi_version(void) {
 
 size_t brh_observation_size(void) {
     return sizeof(brh_observation);
+}
+
+size_t brh_compact_observation_size(void) {
+    return sizeof(brh_compact_observation);
+}
+
+int brh_bridge_should_refresh_sidebar(void) {
+    return bridgeCaptureMode == BRH_CAPTURE_FULL;
+}
+
+int brh_bridge_should_refresh_dungeon_cell(void) {
+    return bridgeCaptureMode == BRH_CAPTURE_FULL;
+}
+
+void brh_bridge_update_compact_cell(short x, short y) {
+    if (bridgeCaptureMode == BRH_CAPTURE_COMPACT) {
+        bridge_compact_update_map_cell(x, y);
+    }
 }
 
 int brh_screen_cols(void) {
@@ -359,26 +448,25 @@ int brh_inventory_str_length(void) {
 }
 
 void brh_close(void) {
-    boolean shouldJoin;
-
-    pthread_mutex_lock(&bridgeMutex);
-    shouldJoin = bridgeThreadStarted;
-    if (shouldJoin) {
+    if (bridgeThreadStarted && !bridgeExited) {
         bridgeCloseRequested = true;
         bridgeActionReady = true;
-        pthread_cond_broadcast(&bridgeCond);
+        while (!bridgeExited && bridgeWaitingForAction) {
+            bridgeWaitingForAction = false;
+            if (bridge_resume_coroutine_locked() != 0) {
+                break;
+            }
+        }
     }
-    pthread_mutex_unlock(&bridgeMutex);
 
-    if (shouldJoin) {
-        pthread_join(bridgeThread, NULL);
-        pthread_mutex_lock(&bridgeMutex);
-        bridgeThreadStarted = false;
-        bridgeWaitingForAction = false;
-        bridgeActionReady = false;
-        bridgeCloseRequested = false;
-        pthread_mutex_unlock(&bridgeMutex);
-    }
+    bridgeThreadStarted = false;
+    bridgeWaitingForAction = false;
+    bridgeActionReady = false;
+    bridgeCloseRequested = false;
+    bridgeExited = false;
+    bridgeExitCode = 0;
+    free(bridgeGameStack);
+    bridgeGameStack = NULL;
 }
 
 void brh_set_data_dir(const char *path) {
@@ -386,10 +474,8 @@ void brh_set_data_dir(const char *path) {
         return;
     }
 
-    pthread_mutex_lock(&bridgeMutex);
     strncpy(dataDirectory, path, BROGUE_FILENAME_MAX - 1);
     dataDirectory[BROGUE_FILENAME_MAX - 1] = '\0';
-    pthread_mutex_unlock(&bridgeMutex);
 }
 
 const char *brh_last_error(void) {
@@ -397,11 +483,39 @@ const char *brh_last_error(void) {
 }
 
 void brh_mark_invalid_key(void) {
-    pthread_mutex_lock(&bridgeMutex);
     if (bridgeThreadStarted && !bridgeExited) {
         bridgeLastStepStatus = BRH_STEP_INVALID_KEY;
     }
-    pthread_mutex_unlock(&bridgeMutex);
+}
+
+void brh_profile_reset(void) {
+    memset(&bridgeProfile, 0, sizeof(bridgeProfile));
+}
+
+void brh_profile_read(brh_profile *out) {
+    if (out == NULL) {
+        return;
+    }
+    *out = bridgeProfile;
+}
+
+uint64_t brh_profile_zone_start(int zone) {
+    if (!bridge_profile_enabled()
+        || zone < 0
+        || zone >= BRH_PROFILE_ZONE_COUNT) {
+        return 0;
+    }
+    return bridge_now_ns();
+}
+
+void brh_profile_zone_end(int zone, uint64_t start_ns) {
+    if (start_ns == 0
+        || zone < 0
+        || zone >= BRH_PROFILE_ZONE_COUNT) {
+        return;
+    }
+    bridgeProfile.zone_calls[zone]++;
+    bridgeProfile.zone_ns[zone] += bridge_now_ns() - start_ns;
 }
 
 brh_env *brh_env_create(const brh_env_buffers *buffers) {
@@ -572,27 +686,29 @@ boolean tryParseUint64(char *str, uint64_t *num) {
     return false;
 }
 
-static void *bridge_thread_main(void *unused) {
+static void bridge_coroutine_main(void) {
     int exitCode;
 
-    (void) unused;
     exitCode = rogueMain();
+    bridge_finish_coroutine_locked(exitCode);
+}
 
-    pthread_mutex_lock(&bridgeMutex);
-    bridgeExitCode = exitCode;
-    bridgeExited = true;
-    bridgeWaitingForAction = false;
-    /*
-     * rogueMain() frees level-owned lists before returning. Keep the last
-     * observation captured at an input boundary instead of walking freed
-     * terrain/item/monster globals during shutdown.
-     */
-    bridgeLastObservation.program_state[1] = 1;
-    bridgeLastObservation.program_state[2] = bridgeEndWon ? 1 : 0;
-    bridgeLastObservation.program_state[6] = (uint64_t) bridgeEndScore;
-    pthread_cond_broadcast(&bridgeCond);
-    pthread_mutex_unlock(&bridgeMutex);
-    return NULL;
+int brh_profile_enabled_from_env(void) {
+    const char *value = getenv("BROGUE_PROFILE");
+    return (value != NULL && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+}
+
+static int bridge_profile_enabled(void) {
+    if (brh_profile_enabled_cache < 0) {
+        brh_profile_enabled_cache = brh_profile_enabled_from_env();
+    }
+    return brh_profile_enabled_cache;
+}
+
+static uint64_t bridge_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
 }
 
 static void bridge_gameLoop(void) {
@@ -600,6 +716,7 @@ static void bridge_gameLoop(void) {
 }
 
 static boolean bridge_pauseForMilliseconds(short milliseconds, PauseBehavior behavior) {
+    if (bridge_profile_enabled()) bridgeProfile.pause_calls++;
     (void) milliseconds;
     (void) behavior;
     return false;
@@ -611,18 +728,43 @@ static void bridge_nextKeyOrMouseEvent(rogueEvent *returnEvent,
     (void) textInput;
     (void) colorsDance;
 
-    pthread_mutex_lock(&bridgeMutex);
-    if (bridgeCaptureObservation) {
-        bridge_fill_observation(&bridgeLastObservation);
+    if (bridge_profile_enabled()) {
+        bridgeProfile.input_yields++;
+    }
+    if (bridgeCaptureMode == BRH_CAPTURE_FULL) {
+        if (bridge_profile_enabled()) {
+            uint64_t obsStart = bridge_now_ns();
+            bridgeProfile.observation_fills++;
+            bridge_fill_observation(&bridgeLastObservation);
+            bridgeProfile.observation_fill_ns += bridge_now_ns() - obsStart;
+        } else {
+            bridge_fill_observation(&bridgeLastObservation);
+        }
+    } else if (bridgeCaptureMode == BRH_CAPTURE_COMPACT) {
+        if (bridge_profile_enabled()) {
+            uint64_t obsStart = bridge_now_ns();
+            bridgeProfile.compact_observation_fills++;
+            bridge_fill_compact_observation(&bridgeLastCompactObservation);
+            bridgeProfile.compact_observation_fill_ns += bridge_now_ns() - obsStart;
+        } else {
+            bridge_fill_compact_observation(&bridgeLastCompactObservation);
+        }
     } else {
         bridge_fill_program_state(&bridgeLastObservation);
     }
     bridgeWaitingForAction = true;
     bridgeActionReady = false;
-    pthread_cond_broadcast(&bridgeCond);
 
-    while (!bridgeActionReady && !bridgeCloseRequested) {
-        pthread_cond_wait(&bridgeCond, &bridgeMutex);
+    if (swapcontext(&bridgeGameContext, &bridgeCallerContext) != 0) {
+        bridge_set_error_locked("failed to yield from Brogue coroutine");
+        rogue.quit = true;
+        rogue.gameHasEnded = true;
+        returnEvent->eventType = KEYSTROKE;
+        returnEvent->param1 = ACKNOWLEDGE_KEY;
+        returnEvent->param2 = 0;
+        returnEvent->controlKey = false;
+        returnEvent->shiftKey = false;
+        return;
     }
 
     if (bridgeCloseRequested) {
@@ -635,7 +777,6 @@ static void bridge_nextKeyOrMouseEvent(rogueEvent *returnEvent,
         returnEvent->shiftKey = false;
         bridgeActionReady = false;
         bridgeWaitingForAction = false;
-        pthread_mutex_unlock(&bridgeMutex);
         return;
     }
 
@@ -643,7 +784,6 @@ static void bridge_nextKeyOrMouseEvent(rogueEvent *returnEvent,
     bridgeActiveControl = bridgePendingEvent.controlKey;
     bridgeActiveShift = bridgePendingEvent.shiftKey;
     bridgeActionReady = false;
-    pthread_mutex_unlock(&bridgeMutex);
 }
 
 static void bridge_plotChar(enum displayGlyph inputChar,
@@ -655,6 +795,7 @@ static void bridge_plotChar(enum displayGlyph inputChar,
                             short backRed,
                             short backGreen,
                             short backBlue) {
+    if (bridge_profile_enabled()) bridgeProfile.plot_calls++;
     (void) inputChar;
     (void) xLoc;
     (void) yLoc;
@@ -672,6 +813,7 @@ static void bridge_remap(const char *input_name, const char *output_name) {
 }
 
 static boolean bridge_modifierHeld(int modifier) {
+    if (bridge_profile_enabled()) bridgeProfile.modifier_calls++;
     if (modifier == 0) {
         return bridgeActiveShift;
     }
@@ -686,6 +828,7 @@ static void bridge_notifyEvent(short eventId,
                                int data2,
                                const char *str1,
                                const char *str2) {
+    if (bridge_profile_enabled()) bridgeProfile.notify_calls++;
     (void) data2;
     (void) str1;
     (void) str2;
@@ -757,7 +900,36 @@ static void bridge_fill_observation(brh_observation *out) {
     bridge_fill_inventory_semantics(out);
 }
 
+static void bridge_fill_compact_observation(brh_compact_observation *out) {
+    if (bridgeCompactMapDirty) {
+        bridge_compact_rebuild_map_chars();
+    }
+    memcpy(out->chars, bridgeCompactMapChars, sizeof(out->chars));
+    memset(out->blstats, 0, sizeof(out->blstats));
+    memset(out->program_state, 0, sizeof(out->program_state));
+
+    out->blstats[0] = player.loc.x;
+    out->blstats[1] = player.loc.y;
+    out->blstats[2] = rogue.strength;
+    out->blstats[3] = player.currentHP;
+    out->blstats[4] = player.info.maxHP;
+    out->blstats[5] = rogue.depthLevel;
+    out->blstats[6] = (int32_t) rogue.gold;
+    out->blstats[7] = (int32_t) rogue.playerTurnNumber;
+    out->blstats[8] = (int32_t) rogue.absoluteTurnNumber;
+    out->blstats[9] = rogue.stealthRange;
+    out->blstats[10] = player.status[STATUS_NUTRITION];
+
+    bridge_fill_compact_program_state(out);
+}
+
 static void bridge_fill_program_state(brh_observation *out) {
+    int prof = bridge_profile_enabled();
+    uint64_t start = 0;
+    if (prof) {
+        start = bridge_now_ns();
+        bridgeProfile.program_fills++;
+    }
     out->program_state[0] = rogue.playerTurnNumber;
     out->program_state[1] = rogue.gameHasEnded ? 1 : 0;
     out->program_state[2] = 0;       /* won: always 0 mid-game; patched to 1 at GAMEOVER_VICTORY */
@@ -768,6 +940,27 @@ static void bridge_fill_program_state(brh_observation *out) {
     out->program_state[7] = (rogue.gameInProgress ? 1 : 0)
                           | (rogue.quit ? 2 : 0)
                           | (rogue.disturbed ? 4 : 0);
+    if (prof) bridgeProfile.program_fill_ns += bridge_now_ns() - start;
+}
+
+static void bridge_fill_compact_program_state(brh_compact_observation *out) {
+    int prof = bridge_profile_enabled();
+    uint64_t start = 0;
+    if (prof) {
+        start = bridge_now_ns();
+        bridgeProfile.program_fills++;
+    }
+    out->program_state[0] = (int32_t) rogue.playerTurnNumber;
+    out->program_state[1] = rogue.gameHasEnded ? 1 : 0;
+    out->program_state[2] = 0;
+    out->program_state[3] = rogue.depthLevel;
+    out->program_state[4] = (int32_t) rogue.seed;
+    out->program_state[5] = (int32_t) rogue.gold;
+    out->program_state[6] = (int32_t) rogue.gold;
+    out->program_state[7] = (rogue.gameInProgress ? 1 : 0)
+                          | (rogue.quit ? 2 : 0)
+                          | (rogue.disturbed ? 4 : 0);
+    if (prof) bridgeProfile.program_fill_ns += bridge_now_ns() - start;
 }
 
 static void bridge_fill_unknown_semantics(brh_observation *out) {
@@ -874,14 +1067,84 @@ static void bridge_fill_inventory_semantics(brh_observation *out) {
 }
 
 static void bridge_set_error(const char *message) {
-    pthread_mutex_lock(&bridgeMutex);
     bridge_set_error_locked(message);
-    pthread_mutex_unlock(&bridgeMutex);
 }
 
 static void bridge_set_error_locked(const char *message) {
     strncpy(bridgeLastError, message, sizeof(bridgeLastError) - 1);
     bridgeLastError[sizeof(bridgeLastError) - 1] = '\0';
+}
+
+static int bridge_start_coroutine_locked(void) {
+    if (bridgeGameStack != NULL) {
+        free(bridgeGameStack);
+        bridgeGameStack = NULL;
+    }
+
+    bridgeGameStack = calloc(1, BRH_THREAD_STACK_SIZE);
+    if (bridgeGameStack == NULL) {
+        bridgeThreadStarted = false;
+        bridge_set_error_locked("failed to allocate Brogue coroutine stack");
+        return -1;
+    }
+
+    if (getcontext(&bridgeGameContext) != 0) {
+        free(bridgeGameStack);
+        bridgeGameStack = NULL;
+        bridgeThreadStarted = false;
+        bridge_set_error_locked("failed to initialize Brogue coroutine context");
+        return -1;
+    }
+
+    bridgeGameContext.uc_stack.ss_sp = bridgeGameStack;
+    bridgeGameContext.uc_stack.ss_size = BRH_THREAD_STACK_SIZE;
+    bridgeGameContext.uc_stack.ss_flags = 0;
+    bridgeGameContext.uc_link = &bridgeCallerContext;
+    makecontext(&bridgeGameContext, bridge_coroutine_main, 0);
+
+    bridgeThreadStarted = true;
+    return 0;
+}
+
+static int bridge_resume_coroutine_locked(void) {
+    int rc = 0;
+    int prof = bridge_profile_enabled();
+    uint64_t start = 0;
+
+    if (prof) {
+        start = bridge_now_ns();
+        bridgeProfile.resume_calls++;
+    }
+    if (!bridgeThreadStarted || bridgeExited) {
+        goto done;
+    }
+    if (swapcontext(&bridgeCallerContext, &bridgeGameContext) != 0) {
+        snprintf(bridgeLastError,
+                 sizeof(bridgeLastError),
+                 "failed to resume Brogue coroutine: %s",
+                 strerror(errno));
+        rc = -1;
+    }
+done:
+    if (prof) bridgeProfile.resume_ns += bridge_now_ns() - start;
+    return rc;
+}
+
+static void bridge_finish_coroutine_locked(int exitCode) {
+    bridgeExitCode = exitCode;
+    bridgeExited = true;
+    bridgeWaitingForAction = false;
+    /*
+     * rogueMain() frees level-owned lists before returning. Keep the last
+     * observation captured at an input boundary instead of walking freed
+     * terrain/item/monster globals during shutdown.
+     */
+    bridgeLastObservation.program_state[1] = 1;
+    bridgeLastObservation.program_state[2] = bridgeEndWon ? 1 : 0;
+    bridgeLastObservation.program_state[6] = (uint64_t) bridgeEndScore;
+    bridgeLastCompactObservation.program_state[1] = 1;
+    bridgeLastCompactObservation.program_state[2] = bridgeEndWon ? 1 : 0;
+    bridgeLastCompactObservation.program_state[6] = (int32_t) bridgeEndScore;
 }
 
 static int bridge_env_validate_active(brh_env *env) {
@@ -911,10 +1174,7 @@ static void bridge_env_update_outputs_from_observation(brh_env *env, const brh_o
     env->terminals[0] = observation->program_state[1] ? 1.0f : 0.0f;
 }
 
-static int bridge_wait_for_observation_locked(boolean allowExit) {
-    while (!bridgeWaitingForAction && !bridgeExited) {
-        pthread_cond_wait(&bridgeCond, &bridgeMutex);
-    }
+static int bridge_check_observation_ready_locked(boolean allowExit) {
     if (bridgeExited && !bridgeWaitingForAction) {
         if (allowExit) {
             return 0;
@@ -923,6 +1183,10 @@ static int bridge_wait_for_observation_locked(boolean allowExit) {
                  sizeof(bridgeLastError),
                  "Brogue bridge exited with status %d",
                  bridgeExitCode);
+        return -1;
+    }
+    if (!bridgeWaitingForAction) {
+        bridge_set_error_locked("Brogue bridge did not reach an input boundary");
         return -1;
     }
     return 0;
@@ -992,6 +1256,99 @@ static int bridge_inventory_slot(const brh_observation *out, char letter) {
         }
     }
     return -1;
+}
+
+static void bridge_compact_rebuild_map_chars(void) {
+    short x;
+    short y;
+
+    for (y = 0; y < DROWS; y++) {
+        for (x = 0; x < DCOLS; x++) {
+            bridge_compact_update_map_cell(x, y);
+        }
+    }
+    bridgeCompactMapDirty = false;
+}
+
+static void bridge_compact_update_map_cell(short x, short y) {
+    int cellIndex;
+    uint32_t ch;
+
+    if (x < 0 || x >= DCOLS || y < 0 || y >= DROWS) {
+        return;
+    }
+
+    cellIndex = y * DCOLS + x;
+    ch = bridge_char_component(bridge_compact_cell_glyph(x, y));
+    bridgeCompactMapChars[cellIndex] = (ch > 0 && ch <= UINT8_MAX) ? (uint8_t) ch : (uint8_t) '?';
+}
+
+static enum displayGlyph bridge_compact_cell_glyph(short x, short y) {
+    pos loc = { x, y };
+    pcell *cell = &pmap[x][y];
+    creature *monst = NULL;
+
+    if (cell->flags & HAS_PLAYER) {
+        return player.info.displayChar;
+    }
+
+    if (cell->flags & HAS_MONSTER) {
+        monst = monsterAtLoc(loc);
+    } else if (cell->flags & HAS_DORMANT_MONSTER) {
+        monst = dormantMonsterAtLoc(loc);
+    }
+
+    if ((cell->flags & HAS_MONSTER)
+        && monst != NULL
+        && (playerCanSeeOrSense(x, y)
+            || ((monst->info.flags & MONST_IMMOBILE) && (cell->flags & DISCOVERED)))
+        && (!monsterIsHidden(monst, &player) || rogue.playbackOmniscience)) {
+        return monst->info.displayChar;
+    }
+
+    if (monst != NULL && monsterRevealed(monst) && !canSeeMonster(monst)) {
+        return monst->info.isLarge ? 'X' : 'x';
+    }
+
+    if ((cell->flags & HAS_ITEM)
+        && !cellHasTerrainFlag(loc, T_OBSTRUCTS_ITEMS)
+        && (playerCanSeeOrSense(x, y)
+            || ((cell->flags & DISCOVERED) && !cellHasTerrainFlag(loc, T_MOVES_ITEMS)))) {
+        item *theItem = itemAtLoc(loc);
+        if (theItem != NULL) {
+            return theItem->displayChar;
+        }
+    }
+
+    return bridge_compact_terrain_glyph(x, y);
+}
+
+static enum displayGlyph bridge_compact_terrain_glyph(short x, short y) {
+    pcell *cell = &pmap[x][y];
+    enum tileType tile = NOTHING;
+
+    if (!playerCanSeeOrSense(x, y)
+        && !(cell->flags & (ITEM_DETECTED | HAS_PLAYER))
+        && (cell->flags & (DISCOVERED | MAGIC_MAPPED))
+        && (cell->flags & STABLE_MEMORY)
+        && cell->rememberedAppearance.character) {
+        return cell->rememberedAppearance.character;
+    }
+
+    if (!(cell->flags & DISCOVERED) && !rogue.playbackOmniscience) {
+        if (!(cell->flags & MAGIC_MAPPED)) {
+            return ' ';
+        }
+        tile = cell->layers[LIQUID] ? cell->layers[LIQUID] : cell->layers[DUNGEON];
+    } else if (cell->layers[SURFACE]) {
+        tile = cell->layers[SURFACE];
+    } else if (cell->layers[LIQUID]) {
+        tile = cell->layers[LIQUID];
+    } else {
+        tile = cell->layers[DUNGEON];
+    }
+
+    return (tile && tileCatalog[tile].displayChar) ? tileCatalog[tile].displayChar : ' ';
 }
 
 static int16_t bridge_observed_item_kind(const item *theItem) {

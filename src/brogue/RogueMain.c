@@ -27,6 +27,7 @@
 #include "GlobalsBrogue.h"
 #include "GlobalsRapidBrogue.h"
 #include "GlobalsBulletBrogue.h"
+#include "bridge-profile.h"
 
 #include <time.h>
 
@@ -43,6 +44,7 @@ void printBrogueVersion() {
 }
 
 void executeEvent(rogueEvent *theEvent) {
+    BRH_PROFILE_START(_brh_profile_execute_event, BRH_ZONE_EXECUTE_EVENT);
     rogue.playbackBetweenTurns = false;
     if (theEvent->eventType == KEYSTROKE) {
         executeKeystroke(theEvent->param1, theEvent->controlKey, theEvent->shiftKey);
@@ -50,6 +52,7 @@ void executeEvent(rogueEvent *theEvent) {
                || theEvent->eventType == RIGHT_MOUSE_UP) {
         executeMouseClick(theEvent);
     }
+    BRH_PROFILE_END(BRH_ZONE_EXECUTE_EVENT, _brh_profile_execute_event);
 }
 
 boolean fileExists(const char *pathname) {
@@ -782,6 +785,10 @@ void startLevel(short oldLevelNumber, short stairDirection) {
         restoreItems();
 
     }
+
+    markLightingMapDirty();
+    markVolumetricGasMapDirty();
+    markEnvironmentTerrainCacheDirty();
 
     // Simulate the environment!
     // First bury the player in limbo while we run the simulation,
