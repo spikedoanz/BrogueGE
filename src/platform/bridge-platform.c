@@ -9,7 +9,7 @@
 #include "bridge-env.h"
 #include "GlobalsBase.h"
 
-#define BRH_ABI_VERSION 8
+#define BRH_ABI_VERSION 9
 #define BRH_OBS_CELLS (COLS * ROWS)
 #define BRH_MAP_CELLS (DCOLS * DROWS)
 #define BRH_MAP_LAYER_CELLS (DCOLS * DROWS * NUMBER_TERRAIN_LAYERS)
@@ -84,6 +84,7 @@ struct brh_env {
 
 int brh_reset(uint64_t seed, brh_observation *out);
 int brh_step(long key, int control, int shift, brh_observation *out);
+int brh_step_no_observation(long key, int control, int shift);
 uint32_t brh_abi_version(void);
 size_t brh_observation_size(void);
 int brh_screen_cols(void);
@@ -99,6 +100,7 @@ void brh_mark_invalid_key(void);
 brh_env *brh_env_create(const brh_env_buffers *buffers);
 int brh_env_reset(brh_env *env, uint64_t seed);
 int brh_env_step(brh_env *env, long key, int control, int shift);
+int brh_env_step_no_observation(brh_env *env, long key, int control, int shift);
 int brh_env_step_from_buffers(brh_env *env);
 int brh_env_num_agents(const brh_env *env);
 void brh_env_close(brh_env *env);
@@ -122,6 +124,7 @@ static boolean bridgeActiveControl = false;
 static boolean bridgeActiveShift = false;
 static int bridgeExitCode = 0;
 static int bridgeLastStepStatus = BRH_STEP_OK;
+static boolean bridgeCaptureObservation = true;
 static char bridgeLastError[256] = "";
 static rogueEvent bridgePendingEvent = {0};
 static brh_observation bridgeLastObservation = {0};
@@ -155,14 +158,21 @@ static void bridge_notifyEvent(short eventId,
 static enum graphicsModes bridge_setGraphicsMode(enum graphicsModes mode);
 static void bridge_fill_observation(brh_observation *out);
 static void bridge_fill_unknown_semantics(brh_observation *out);
+static void bridge_fill_program_state(brh_observation *out);
 static void bridge_fill_map_semantics(brh_observation *out);
 static void bridge_fill_item_semantics(brh_observation *out);
 static void bridge_fill_monster_semantics(brh_observation *out);
 static void bridge_fill_inventory_semantics(brh_observation *out);
 static void bridge_set_error(const char *message);
 static void bridge_set_error_locked(const char *message);
+static int bridge_step_internal(long key,
+                                int control,
+                                int shift,
+                                brh_observation *out,
+                                boolean captureObservation);
 static int bridge_env_validate_active(brh_env *env);
 static void bridge_env_update_outputs(brh_env *env);
+static void bridge_env_update_outputs_from_observation(brh_env *env, const brh_observation *observation);
 static int bridge_wait_for_observation_locked(boolean allowExit);
 static void bridge_copy_observation(brh_observation *to, const brh_observation *from);
 static void bridge_initialize_launch_state(uint64_t seed);
@@ -213,6 +223,7 @@ int brh_reset(uint64_t seed, brh_observation *out) {
     bridgeExited = false;
     bridgeExitCode = 0;
     bridgeLastStepStatus = BRH_STEP_OK;
+    bridgeCaptureObservation = true;
     bridgeActiveControl = false;
     bridgeActiveShift = false;
     memset(&bridgeLastObservation, 0, sizeof(bridgeLastObservation));
@@ -262,9 +273,21 @@ int brh_reset(uint64_t seed, brh_observation *out) {
 }
 
 int brh_step(long key, int control, int shift, brh_observation *out) {
+    return bridge_step_internal(key, control, shift, out, true);
+}
+
+int brh_step_no_observation(long key, int control, int shift) {
+    return bridge_step_internal(key, control, shift, NULL, false);
+}
+
+static int bridge_step_internal(long key,
+                                int control,
+                                int shift,
+                                brh_observation *out,
+                                boolean captureObservation) {
     int rc;
 
-    if (out == NULL) {
+    if (captureObservation && out == NULL) {
         bridge_set_error("observation pointer must not be null");
         return -1;
     }
@@ -287,13 +310,16 @@ int brh_step(long key, int control, int shift, brh_observation *out) {
     bridgePendingEvent.controlKey = control ? true : false;
     bridgePendingEvent.shiftKey = shift ? true : false;
     bridgeLastStepStatus = BRH_STEP_OK;
+    bridgeCaptureObservation = captureObservation;
     bridgeActionReady = true;
     bridgeWaitingForAction = false;
     pthread_cond_broadcast(&bridgeCond);
 
     rc = bridge_wait_for_observation_locked(true);
     if (rc == 0) {
-        bridge_copy_observation(out, &bridgeLastObservation);
+        if (captureObservation) {
+            bridge_copy_observation(out, &bridgeLastObservation);
+        }
         rc = bridgeLastStepStatus;
     }
     pthread_mutex_unlock(&bridgeMutex);
@@ -464,6 +490,27 @@ int brh_env_step(brh_env *env, long key, int control, int shift) {
     return rc;
 }
 
+int brh_env_step_no_observation(brh_env *env, long key, int control, int shift) {
+    int rc;
+
+    if (bridge_env_validate_active(env) != 0) {
+        return -1;
+    }
+    if (!env->running) {
+        bridge_set_error("BrogueEnv is not running; call brh_env_reset first");
+        return -1;
+    }
+
+    rc = brh_step_no_observation(key, control, shift);
+    if (rc >= 0) {
+        bridge_env_update_outputs_from_observation(env, &bridgeLastObservation);
+        if (env->terminals[0] != 0.0f) {
+            env->running = false;
+        }
+    }
+    return rc;
+}
+
 int brh_env_step_from_buffers(brh_env *env) {
     int control = 0;
     int shift = 0;
@@ -565,7 +612,11 @@ static void bridge_nextKeyOrMouseEvent(rogueEvent *returnEvent,
     (void) colorsDance;
 
     pthread_mutex_lock(&bridgeMutex);
-    bridge_fill_observation(&bridgeLastObservation);
+    if (bridgeCaptureObservation) {
+        bridge_fill_observation(&bridgeLastObservation);
+    } else {
+        bridge_fill_program_state(&bridgeLastObservation);
+    }
     bridgeWaitingForAction = true;
     bridgeActionReady = false;
     pthread_cond_broadcast(&bridgeCond);
@@ -698,6 +749,15 @@ static void bridge_fill_observation(brh_observation *out) {
     out->blstats[9] = rogue.stealthRange;
     out->blstats[10] = player.status[STATUS_NUTRITION];
 
+    bridge_fill_program_state(out);
+
+    bridge_fill_map_semantics(out);
+    bridge_fill_item_semantics(out);
+    bridge_fill_monster_semantics(out);
+    bridge_fill_inventory_semantics(out);
+}
+
+static void bridge_fill_program_state(brh_observation *out) {
     out->program_state[0] = rogue.playerTurnNumber;
     out->program_state[1] = rogue.gameHasEnded ? 1 : 0;
     out->program_state[2] = 0;       /* won: always 0 mid-game; patched to 1 at GAMEOVER_VICTORY */
@@ -708,11 +768,6 @@ static void bridge_fill_observation(brh_observation *out) {
     out->program_state[7] = (rogue.gameInProgress ? 1 : 0)
                           | (rogue.quit ? 2 : 0)
                           | (rogue.disturbed ? 4 : 0);
-
-    bridge_fill_map_semantics(out);
-    bridge_fill_item_semantics(out);
-    bridge_fill_monster_semantics(out);
-    bridge_fill_inventory_semantics(out);
 }
 
 static void bridge_fill_unknown_semantics(brh_observation *out) {
@@ -848,8 +903,12 @@ static int bridge_env_validate_active(brh_env *env) {
 }
 
 static void bridge_env_update_outputs(brh_env *env) {
+    bridge_env_update_outputs_from_observation(env, env->observations);
+}
+
+static void bridge_env_update_outputs_from_observation(brh_env *env, const brh_observation *observation) {
     env->rewards[0] = 0.0f;
-    env->terminals[0] = env->observations->program_state[1] ? 1.0f : 0.0f;
+    env->terminals[0] = observation->program_state[1] ? 1.0f : 0.0f;
 }
 
 static int bridge_wait_for_observation_locked(boolean allowExit) {

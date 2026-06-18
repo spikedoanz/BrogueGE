@@ -29,12 +29,14 @@ const char *brh_last_error(void);
 
 int brh_reset(uint64_t seed, brh_observation *out);
 int brh_step(long key, int control, int shift, brh_observation *out);
+int brh_step_no_observation(long key, int control, int shift);
 void brh_close(void);
 void brh_mark_invalid_key(void);
 
 brh_env *brh_env_create(const brh_env_buffers *buffers);
 int brh_env_reset(brh_env *env, uint64_t seed);
 int brh_env_step(brh_env *env, long key, int control, int shift);
+int brh_env_step_no_observation(brh_env *env, long key, int control, int shift);
 int brh_env_step_from_buffers(brh_env *env);
 int brh_env_num_agents(const brh_env *env);
 void brh_env_close(brh_env *env);
