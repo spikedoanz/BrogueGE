@@ -6,9 +6,10 @@
 #include <string.h>
 
 #include "platform.h"
+#include "bridge-env.h"
 #include "GlobalsBase.h"
 
-#define BRH_ABI_VERSION 7
+#define BRH_ABI_VERSION 8
 #define BRH_OBS_CELLS (COLS * ROWS)
 #define BRH_MAP_CELLS (DCOLS * DROWS)
 #define BRH_MAP_LAYER_CELLS (DCOLS * DROWS * NUMBER_TERRAIN_LAYERS)
@@ -34,7 +35,7 @@
                             | ITEM_CAN_BE_IDENTIFIED | ITEM_MAGIC_DETECTED \
                             | ITEM_MAX_CHARGES_KNOWN | ITEM_IS_KEY | ITEM_PLAYER_AVOIDS)
 
-typedef struct brh_observation {
+struct brh_observation {
     int16_t glyphs[BRH_OBS_CELLS];
     uint32_t chars[BRH_OBS_CELLS];
     uint8_t colors_fg[BRH_COLOR_CELLS];
@@ -67,7 +68,19 @@ typedef struct brh_observation {
     int64_t blstats[BRH_BLSTATS_SIZE];
     uint8_t message[BRH_MESSAGE_SIZE];
     uint64_t program_state[BRH_PROGRAM_STATE_SIZE];
-} brh_observation;
+};
+
+struct brh_env {
+    brh_observation *observations;
+    long *actions;
+    uint8_t *controls;
+    uint8_t *shifts;
+    float *rewards;
+    float *terminals;
+    int num_agents;
+    unsigned int rng;
+    boolean running;
+};
 
 int brh_reset(uint64_t seed, brh_observation *out);
 int brh_step(long key, int control, int shift, brh_observation *out);
@@ -83,6 +96,12 @@ void brh_close(void);
 void brh_set_data_dir(const char *path);
 const char *brh_last_error(void);
 void brh_mark_invalid_key(void);
+brh_env *brh_env_create(const brh_env_buffers *buffers);
+int brh_env_reset(brh_env *env, uint64_t seed);
+int brh_env_step(brh_env *env, long key, int control, int shift);
+int brh_env_step_from_buffers(brh_env *env);
+int brh_env_num_agents(const brh_env *env);
+void brh_env_close(brh_env *env);
 
 struct brogueConsole currentConsole;
 char dataDirectory[BROGUE_FILENAME_MAX] = STRINGIFY(DATADIR);
@@ -108,6 +127,8 @@ static rogueEvent bridgePendingEvent = {0};
 static brh_observation bridgeLastObservation = {0};
 static int64_t bridgeEndScore = 0;
 static boolean bridgeEndWon = false;
+static pthread_mutex_t bridgeEnvMutex = PTHREAD_MUTEX_INITIALIZER;
+static brh_env *bridgeActiveEnv = NULL;
 
 static void *bridge_thread_main(void *unused);
 static void bridge_gameLoop(void);
@@ -140,6 +161,8 @@ static void bridge_fill_monster_semantics(brh_observation *out);
 static void bridge_fill_inventory_semantics(brh_observation *out);
 static void bridge_set_error(const char *message);
 static void bridge_set_error_locked(const char *message);
+static int bridge_env_validate_active(brh_env *env);
+static void bridge_env_update_outputs(brh_env *env);
 static int bridge_wait_for_observation_locked(boolean allowExit);
 static void bridge_copy_observation(brh_observation *to, const brh_observation *from);
 static void bridge_initialize_launch_state(uint64_t seed);
@@ -353,6 +376,139 @@ void brh_mark_invalid_key(void) {
         bridgeLastStepStatus = BRH_STEP_INVALID_KEY;
     }
     pthread_mutex_unlock(&bridgeMutex);
+}
+
+brh_env *brh_env_create(const brh_env_buffers *buffers) {
+    brh_env *env;
+
+    if (buffers == NULL) {
+        bridge_set_error("BrogueEnv buffers pointer must not be null");
+        return NULL;
+    }
+    if (buffers->observations == NULL) {
+        bridge_set_error("BrogueEnv observations buffer must not be null");
+        return NULL;
+    }
+    if (buffers->rewards == NULL) {
+        bridge_set_error("BrogueEnv rewards buffer must not be null");
+        return NULL;
+    }
+    if (buffers->terminals == NULL) {
+        bridge_set_error("BrogueEnv terminals buffer must not be null");
+        return NULL;
+    }
+
+    pthread_mutex_lock(&bridgeEnvMutex);
+    if (bridgeActiveEnv != NULL) {
+        pthread_mutex_unlock(&bridgeEnvMutex);
+        bridge_set_error("only one live BrogueEnv is supported until Brogue state is per-env");
+        return NULL;
+    }
+
+    env = (brh_env *) calloc(1, sizeof(*env));
+    if (env == NULL) {
+        pthread_mutex_unlock(&bridgeEnvMutex);
+        bridge_set_error("failed to allocate BrogueEnv");
+        return NULL;
+    }
+
+    env->observations = buffers->observations;
+    env->actions = buffers->actions;
+    env->controls = buffers->controls;
+    env->shifts = buffers->shifts;
+    env->rewards = buffers->rewards;
+    env->terminals = buffers->terminals;
+    env->num_agents = 1;
+    env->rng = 0;
+    env->running = false;
+    bridgeActiveEnv = env;
+    pthread_mutex_unlock(&bridgeEnvMutex);
+    return env;
+}
+
+int brh_env_reset(brh_env *env, uint64_t seed) {
+    int rc;
+
+    if (bridge_env_validate_active(env) != 0) {
+        return -1;
+    }
+
+    rc = brh_reset(seed, env->observations);
+    if (rc == 0) {
+        env->running = true;
+        bridge_env_update_outputs(env);
+    } else {
+        env->running = false;
+    }
+    return rc;
+}
+
+int brh_env_step(brh_env *env, long key, int control, int shift) {
+    int rc;
+
+    if (bridge_env_validate_active(env) != 0) {
+        return -1;
+    }
+    if (!env->running) {
+        bridge_set_error("BrogueEnv is not running; call brh_env_reset first");
+        return -1;
+    }
+
+    rc = brh_step(key, control, shift, env->observations);
+    if (rc >= 0) {
+        bridge_env_update_outputs(env);
+        if (env->terminals[0] != 0.0f) {
+            env->running = false;
+        }
+    }
+    return rc;
+}
+
+int brh_env_step_from_buffers(brh_env *env) {
+    int control = 0;
+    int shift = 0;
+
+    if (bridge_env_validate_active(env) != 0) {
+        return -1;
+    }
+    if (env->actions == NULL) {
+        bridge_set_error("BrogueEnv action buffer must not be null for brh_env_step_from_buffers");
+        return -1;
+    }
+    if (env->controls != NULL) {
+        control = env->controls[0] ? 1 : 0;
+    }
+    if (env->shifts != NULL) {
+        shift = env->shifts[0] ? 1 : 0;
+    }
+    return brh_env_step(env, env->actions[0], control, shift);
+}
+
+int brh_env_num_agents(const brh_env *env) {
+    if (env == NULL) {
+        return 0;
+    }
+    return env->num_agents;
+}
+
+void brh_env_close(brh_env *env) {
+    boolean shouldClose = false;
+
+    if (env == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&bridgeEnvMutex);
+    if (bridgeActiveEnv == env) {
+        bridgeActiveEnv = NULL;
+        shouldClose = true;
+    }
+    pthread_mutex_unlock(&bridgeEnvMutex);
+
+    if (shouldClose) {
+        brh_close();
+        free(env);
+    }
 }
 
 boolean tryParseUint64(char *str, uint64_t *num) {
@@ -671,6 +827,29 @@ static void bridge_set_error(const char *message) {
 static void bridge_set_error_locked(const char *message) {
     strncpy(bridgeLastError, message, sizeof(bridgeLastError) - 1);
     bridgeLastError[sizeof(bridgeLastError) - 1] = '\0';
+}
+
+static int bridge_env_validate_active(brh_env *env) {
+    boolean valid;
+
+    if (env == NULL) {
+        bridge_set_error("BrogueEnv handle must not be null");
+        return -1;
+    }
+
+    pthread_mutex_lock(&bridgeEnvMutex);
+    valid = (bridgeActiveEnv == env);
+    pthread_mutex_unlock(&bridgeEnvMutex);
+    if (!valid) {
+        bridge_set_error("BrogueEnv handle is not active");
+        return -1;
+    }
+    return 0;
+}
+
+static void bridge_env_update_outputs(brh_env *env) {
+    env->rewards[0] = 0.0f;
+    env->terminals[0] = env->observations->program_state[1] ? 1.0f : 0.0f;
 }
 
 static int bridge_wait_for_observation_locked(boolean allowExit) {

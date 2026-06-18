@@ -11,6 +11,7 @@ This fork adds a single new platform backend (`bridge-platform.c`) and small
 
 ### Added files
 - `src/platform/bridge-platform.c` — pthread-based bridge implementing the `brh_*` API
+- `src/platform/bridge-env.h` — scalar C environment ABI for caller-owned buffers
 
 ### Modified files (behind `#ifdef BROGUE_BRIDGE`)
 - `src/brogue/IO.c` — invalid-key marking hook
