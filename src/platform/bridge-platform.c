@@ -739,6 +739,19 @@ static void bridge_nextKeyOrMouseEvent(rogueEvent *returnEvent,
     (void) textInput;
     (void) colorsDance;
 
+    if (bridgeCloseRequested) {
+        rogue.quit = true;
+        rogue.gameHasEnded = true;
+        returnEvent->eventType = KEYSTROKE;
+        returnEvent->param1 = ESCAPE_KEY;
+        returnEvent->param2 = 0;
+        returnEvent->controlKey = false;
+        returnEvent->shiftKey = false;
+        bridgeActionReady = false;
+        bridgeWaitingForAction = false;
+        return;
+    }
+
     if (bridge_profile_enabled()) {
         bridgeProfile.input_yields++;
     }
@@ -771,7 +784,7 @@ static void bridge_nextKeyOrMouseEvent(rogueEvent *returnEvent,
         rogue.quit = true;
         rogue.gameHasEnded = true;
         returnEvent->eventType = KEYSTROKE;
-        returnEvent->param1 = ACKNOWLEDGE_KEY;
+        returnEvent->param1 = ESCAPE_KEY;
         returnEvent->param2 = 0;
         returnEvent->controlKey = false;
         returnEvent->shiftKey = false;
