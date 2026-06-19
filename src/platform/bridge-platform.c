@@ -955,7 +955,7 @@ static void bridge_fill_program_state(brh_observation *out) {
         bridgeProfile.program_fills++;
     }
     out->program_state[0] = rogue.playerTurnNumber;
-    out->program_state[1] = rogue.gameHasEnded ? 1 : 0;
+    out->program_state[1] = (rogue.gameHasEnded || !rogue.gameInProgress) ? 1 : 0;
     out->program_state[2] = 0;       /* won: always 0 mid-game; patched to 1 at GAMEOVER_VICTORY */
     out->program_state[3] = rogue.depthLevel;
     out->program_state[4] = rogue.seed;
@@ -975,7 +975,7 @@ static void bridge_fill_compact_program_state(brh_compact_observation *out) {
         bridgeProfile.program_fills++;
     }
     out->program_state[0] = (int32_t) rogue.playerTurnNumber;
-    out->program_state[1] = rogue.gameHasEnded ? 1 : 0;
+    out->program_state[1] = (rogue.gameHasEnded || !rogue.gameInProgress) ? 1 : 0;
     out->program_state[2] = 0;
     out->program_state[3] = rogue.depthLevel;
     out->program_state[4] = (int32_t) rogue.seed;
